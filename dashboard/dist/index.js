@@ -27,6 +27,7 @@
       title: "Context Lens",
       kicker: "CONTEXT INSIGHT",
       subtitle: "What your agent is carrying, where it came from, and how it changes.",
+      footer: "Context Lens · reads local state.db only · estimates are marked",
       overview: "Overview",
       session: "Session",
       refresh: "Refresh",
@@ -92,6 +93,7 @@
       title: "لنز زمینه",
       kicker: "بینش زمینه",
       subtitle: "اینکه ایجنت چه چیزی را حمل می\u200cکند، از کجا آمده و چگونه تغییر می\u200cکند.",
+      footer: "لنز زمینه · فقط state.db محلی را می\u200cخواند · تخمین\u200cها مشخص شده\u200cاند",
       overview: "نمای کلی",
       session: "نشست",
       refresh: "تازه\u200cسازی",
@@ -620,10 +622,11 @@
   }
 
   function App() {
-    var langState = useState(function () {
-      try { return localStorage.getItem("context-lens.lang") || "en"; } catch (e) { return "en"; }
-    });
-    var lang = langState[0], setLang = langState[1];
+    var i18n = SDK.useI18n ? SDK.useI18n() : null;
+    var globalLocale = (i18n && i18n.locale) ||
+      (typeof document !== "undefined" ? document.documentElement.lang : "en");
+    var lang = globalLocale === "fa" ? "fa" : "en";
+    var dir = globalLocale === "fa" || globalLocale === "ar" ? "rtl" : "ltr";
     var rangeState = useState(30);
     var days = rangeState[0], setDays = rangeState[1];
     var viewState = useState({ view: "overview", id: null });
@@ -637,11 +640,6 @@
     var sessionReq = useJson(sessionUrl || API + "/health");
     var sessionState = sessionReq[0], refreshSession = sessionReq[1];
 
-    useEffect(function () {
-      try { localStorage.setItem("context-lens.lang", lang); } catch (e) { /* ignore */ }
-    }, [lang]);
-
-    var dir = t(lang, "dir");
     var loading = overview.loading && !overview.data;
     var error = overview.error;
 
@@ -669,10 +667,7 @@
           ),
           h(Button, { variant: "outline", size: "sm",
             onClick: view.view === "session" ? refreshSession : refreshOverview },
-            t(lang, "refresh")),
-          h("button", { className: "lens-lang",
-            onClick: function () { setLang(lang === "fa" ? "en" : "fa"); } },
-            t(lang, "lang"))
+            t(lang, "refresh"))
         )
       ),
       error ? h("div", { className: "lens-error" }, t(lang, "error") + ": " + String(error.message || error)) : null,
@@ -684,7 +679,7 @@
       ) : null,
       h("div", { className: "lens-foot" },
         h(Separator, null),
-        h("span", null, "Context Lens · reads local state.db only · estimates are marked")
+        h("span", null, t(lang, "footer"))
       )
     );
   }

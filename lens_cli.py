@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 from typing import Any
 
@@ -82,9 +84,24 @@ def _setup(subparser: argparse.ArgumentParser) -> None:
     dashboard = commands.add_parser("dashboard", help="Where to open the visual tab")
     dashboard.set_defaults(lens_command="dashboard")
 
+    update = commands.add_parser("update", help="Update the plugin from GitHub")
+    update.add_argument("--check", action="store_true", help="Only check for an update")
+
 
 def _emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _run_update(check: bool = False) -> int:
+    """Delegate to Hermes' own plugin updater (provenance-aware)."""
+    exe = shutil.which("hermes") or "hermes"
+    command = [exe, "plugins", "check-updates"] if check else [exe, "plugins", "update", "context-lens"]
+    print("$ " + " ".join(command))
+    try:
+        return subprocess.call(command)
+    except OSError as exc:
+        print(f"Could not run {exe}: {exc}", file=sys.stderr)
+        return 2
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -94,6 +111,8 @@ def _run(args: argparse.Namespace) -> None:
         print("  hermes dashboard")
         print("Then choose 'Context Lens' in the sidebar (after Analytics).")
         return
+    if command == "update":
+        raise SystemExit(_run_update(check=bool(getattr(args, "check", False))))
 
     db = getattr(args, "db", None)
     try:
