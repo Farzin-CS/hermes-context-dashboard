@@ -1,77 +1,70 @@
-# Context Lens
+<div align="center">
 
-**Context insight for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — see what your agent is carrying, where it came from, and how it changes.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+  <img alt="Context Lens" src="docs/logo-light.svg" width="420">
+</picture>
 
-Context Lens is a Hermes-native take on the context dashboard idea from
-[`dsh-context`](https://github.com/bowenliang123/dsh-context) (DeepSeek Harness).
-It does not port DSH code or depend on its runtime: it reads Hermes' own
-`state.db`, so it works on every session Hermes has already recorded — no
-instrumentation, no extra logging, no network.
+### See what your agent is carrying.
 
-```
-Context Lens - last 30 days
-=================================
+Context insight for Hermes Agent — token composition, context trends, skills, tools, commands, and the agent fleet.
 
-Sessions 42 · Turns 318 · Tool calls 2,914 · Active 9h 12m
-Billed 184.6M tokens · est. $4.21 · cache hit 93.8%
-In 21.4M · Out 1.9M · Cache 161.3M
+<p>
+  <a href="https://github.com/Farzin-CS/hermes-context-lens/releases"><img src="https://img.shields.io/github/v/release/Farzin-CS/hermes-context-lens?color=6366f1&labelColor=0b1220&style=flat-square" alt="release"></a>
+  <a href="https://github.com/Farzin-CS/hermes-context-lens/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-white?labelColor=0b1220&style=flat-square" alt="license"></a>
+  <a href="https://github.com/NousResearch/hermes-agent"><img src="https://img.shields.io/badge/Hermes-%E2%89%A50.22-0ea5e9?labelColor=0b1220&style=flat-square" alt="Hermes >= 0.22"></a>
+  <a href="https://github.com/Farzin-CS/hermes-context-lens"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-64748b?labelColor=0b1220&style=flat-square" alt="platform"></a>
+  <a href="https://github.com/Farzin-CS/hermes-context-lens/stargazers"><img src="https://img.shields.io/github/stars/Farzin-CS/hermes-context-lens?color=f59e0b&labelColor=0b1220&style=flat-square" alt="stars"></a>
+</p>
 
-Usage
-  Nov 03  ███████                  18.4M
-  Nov 04  ████████████████████     51.2M
-  ...
+<p>
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-you-get">What you get</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#development">Development</a>
+</p>
 
-Current context composition (estimated)
-  Tool results       ██████           36.2%  2.4M
-  Reasoning          ███              20.7%  1.3M
-  Tool definitions   ███              15.9%  1.0M
-  ...
+<img src="docs/dashboard.png" alt="The Context Lens dashboard: KPI cards, daily token usage, context composition, activity heatmap, skill/tool/command ledgers, and recent sessions" width="900">
 
-Sessions (42)
-  20261109_0542  telegram  deepseek-flash  204.3k ctx (20.4%)  $0.077  ...
-```
+</div>
 
-## What it gives you
+---
 
-| Surface | What you get |
-|---|---|
-| `/lens` in chat | Current session at a glance: context gauge, token split, composition, skills, fleet. Works in CLI, TUI, Desktop, Telegram, Discord, … |
-| `hermes context-lens` | Cross-session dashboard in the terminal: KPI, daily usage, skills/tools/commands, file activity, session list. `--json` for scripts. |
-| `hermes dashboard` → **Context Lens** | Visual tab: KPI cards, daily chart, 8-week activity heatmap, composition donut, skill/tool/command ledgers, session table, full session detail with context trend, files, commands, events and the agent fleet. |
-| English / فارسی toggle | The dashboard tab ships an RTL Persian UI alongside English. |
+**Context Lens** is a Hermes Agent plugin that turns the local session database into a context dashboard. It answers the questions a token counter cannot: what is inside the window right now, which part is growing, what the agent did with it, and how the context evolved step by step.
 
-### Session detail
+It reads `state.db` directly — read-only, already recorded, no instrumentation. Every session Hermes has written is available immediately, including the one you are in.
 
-```bash
-hermes context-lens session              # latest session
-hermes context-lens session <session-id> # any recorded session
-hermes context-lens session --json       # machine-readable
-```
+## Why Context Lens
 
-The detail view covers:
-
-- **Context window** — provider-anchored prompt size when Hermes recorded one
-  (`model_config._usage_anchor`), otherwise an estimate; resolved against the
-  model's real window.
-- **Composition** — system prompt, tool schemas, skills index, user messages,
-  injected context, assistant replies, reasoning, tool calls, tool results.
-- **Trend** — estimated prompt size at every assistant step.
-- **Events** — session resets, parent continuation, compaction summaries, model
-  changes.
-- **File activity** — reads / writes / edits per path.
-- **Commands** — shell and code executions with exit codes when the tool result
-  recorded one.
-- **Fleet** — parent session, child sessions, and async delegations.
+- **See the whole window, not one number.** System prompt, tool schemas, skills index, user messages, injected context, assistant replies, reasoning, tool calls and tool results — with an estimated share for each.
+- **Find what actually eats the context.** In a long agent session the answer is usually tool results, not the conversation. Context Lens makes that visible instead of leaving you with a single percentage.
+- **Follow the session over time.** The trend view estimates the prompt size at every assistant step, so a sudden jump has a step number and a timestamp.
+- **Know what the agent did.** Loaded skills, tool calls, command executions, exit codes and file activity are collected from the transcript, not from a separate log.
+- **Watch the family.** Parent sessions, child sessions and async delegations are shown together, with each child's token count and context pressure.
+- **Stay local.** No network calls, no telemetry, no extra database. The plugin only reads files Hermes already wrote.
 
 ## Install
-
-From GitHub (after the repo is public):
 
 ```bash
 hermes plugins install Farzin-CS/hermes-context-lens --enable
 ```
 
-Manual install:
+Open the dashboard and choose **Context Lens** in the sidebar:
+
+```bash
+hermes dashboard
+```
+
+In chat, type:
+
+```text
+/lens
+```
+
+<details>
+<summary>Manual install</summary>
 
 ```bash
 git clone https://github.com/Farzin-CS/hermes-context-lens \
@@ -79,133 +72,165 @@ git clone https://github.com/Farzin-CS/hermes-context-lens \
 hermes plugins enable context-lens
 ```
 
-On Windows the default Hermes home is `%LOCALAPPDATA%\hermes`; the plugin
-directory is `%LOCALAPPDATA%\hermes\plugins\context-lens`.
+On Windows the default Hermes home is `%LOCALAPPDATA%\hermes`; the plugin directory is `%LOCALAPPDATA%\hermes\plugins\context-lens`.
 
-Then open the dashboard tab:
+</details>
 
-```bash
-hermes dashboard
-```
+## Quick start
 
-The **Context Lens** tab appears after **Analytics**. In chat, type `/lens`.
-
-## Usage
+Three entry points, one data model.
 
 ```bash
-# last 30 days (default)
-hermes context-lens
-
-# a window, a platform, archived sessions
+hermes context-lens                    # last 30 days
 hermes context-lens overview --days 7
-hermes context-lens overview --days 30 --source telegram
-hermes context-lens overview --days 0            # all time
-hermes context-lens overview --all --json
-
-# one session
-hermes context-lens session 20261109_054212_2be8a15c
-
-# another profile's database
-hermes context-lens --db /path/to/state.db overview
+hermes context-lens overview --days 0  # all time
+hermes context-lens session <id>       # one session
+hermes context-lens session --json     # machine-readable
 ```
-
-Chat commands:
 
 ```text
 /lens                  current session, compact
 /lens full             full session view
-/lens overview         cross-session dashboard (7 days)
 /lens overview 30      30-day window
 /lens session <id>     another session
 ```
 
-## How the numbers are produced
+The terminal view is deliberately plain text — it works over SSH, in the classic CLI, and in the TUI:
 
-Context Lens reads `state.db` in **read-only** mode and never writes to it.
+```text
+Context Lens - last 7 days
+================================
 
-| Metric | Source |
+Sessions 12 · Turns 84 · Tool calls 431 · Active 3h 18m
+Billed 48.2M tokens · est. $1.84 · cache hit 94.1%
+In 6.1M · Out 712k · Cache 41.4M
+
+Usage
+  Nov 03  ███                      2.1M
+  Nov 04  ████████████            8.6M
+  Nov 05  ██████                  4.2M
+  ...
+
+Current context composition (estimated)
+  Tool results       ██████           41.2%  183k
+  Reasoning          ███              21.8%  97k
+  Tool definitions   ██               14.9%  66k
+  ...
+```
+
+## What you get
+
+| Surface | What it shows |
 |---|---|
-| Sessions, messages, turns, tool calls | `sessions` / `messages` |
-| Billed input / output / cache | `sessions.input_tokens`, `output_tokens`, `cache_read_tokens` |
-| Cost | `estimated_cost_usd` (or `actual_cost_usd` when present) |
-| Composition | Stored system prompt + tool schemas + per-message content, tokens estimated with Hermes' own `estimate_tokens_rough` |
-| Current context | `model_config._usage_anchor.prompt_tokens`, else the composition estimate |
-| Context window | Hermes model metadata (`get_model_context_length`) |
-| Skills | `skill_view` calls |
-| Commands | `terminal` / `execute_code` arguments; exit codes parsed from tool results |
-| Files | `read_file` / `write_file` / `patch` arguments |
-| Fleet | `sessions.parent_session_id`, `async_delegations` |
+| **`/lens`** | The current session at a glance: context gauge, token split, composition, loaded skills, and fleet. Works in CLI, TUI, Desktop, Telegram, Discord, and the rest of the gateway. |
+| **`hermes context-lens`** | Cross-session dashboard in the terminal: KPI, daily usage, skills/tools/commands, file activity, and a session list. `--json` for scripts. |
+| **Dashboard tab** | The visual version: KPI cards, daily chart, 8-week activity heatmap, composition donut, skill/tool/command ledgers, session table, and full session detail. |
+| **English + فارسی** | The dashboard tab ships an English UI and an RTL Persian UI. The toggle is in the page header. |
 
-Known limits, stated rather than hidden:
+### Session detail
 
-- **Composition and trend are estimates.** Hermes does not persist a
-  per-request token ledger for historical sessions, so categories use the same
-  byte-aware estimate family as its `/context` command. The current-context
-  number prefers the provider's own anchor when one exists.
-- **Daily attribution is approximate.** Session totals are distributed across
-  the assistant steps' timestamps; a session with one API call has one bucket.
-- **Command exit codes are best-effort.** They are parsed from the stored tool
-  result; a tool that never reports one shows as unknown.
-- **Injected memory is not persisted** in the transcript by Hermes, so it is
-  counted only when it appears inside a stored message or system prompt.
-- **Archived sessions are excluded by default**; pass `--all` to include them.
+<img src="docs/session.png" alt="Context Lens session detail: context window, composition, trend, file activity, commands, fleet, and context events" width="900">
 
-## Development
+The detail view adds:
 
-No build step. Python uses the standard library; the dashboard bundle is plain
-JavaScript (React comes from the dashboard SDK). PyYAML is used only when it is
-already present, to read Hermes' model-length cache and config.
+- **Context window** — provider-anchored prompt size when Hermes recorded one; otherwise a labelled estimate, resolved against the model's real window.
+- **Context trend** — estimated prompt size at every assistant step.
+- **Context events** — session resets, parent continuation, compaction summaries and model changes.
+- **File activity** — reads, writes and edits per path.
+- **Commands** — shell and code executions, with exit codes when the tool result recorded one.
+- **Fleet** — parent session, child sessions, and async delegations.
 
-```bash
-python -m unittest discover -s tests -v
-hermes plugins doctor . --ci
+## How it works
+
+```text
+state.db (read-only)
+├── sessions / messages / system prompts / tool schemas
+├── session_model_usage / async_delegations
+└── Hermes' own indexes
+          │
+          ▼
+      lens_core
+      ├── /lens ─────────────── chat: CLI, TUI, Desktop, Telegram, Discord
+      ├── hermes context-lens ─ terminal + JSON
+      └── dashboard API ─────── Context Lens tab
 ```
 
-Run the dashboard against another database (handy for demos or tests):
+`lens_core` is a small stdlib Python module. It reads the database with `mode=ro`, aggregates the fields Hermes already stores, and estimates token sizes with the same byte-aware approach as Hermes' own `/context` command.
 
-```bash
-CONTEXT_LENS_DB=/path/to/state.db hermes dashboard --port 9123
-```
+The current-context number prefers `model_config._usage_anchor.prompt_tokens` — the provider's own measurement — and falls back to the composition estimate only when no anchor exists. That distinction is shown in the UI, not hidden.
 
 ## Performance
 
-Benchmarked on a synthetic Hermes-format database: **500 sessions, 100,000 messages,
-260 MB**, with Hermes' own indexes applied (they matter: without them the per-session
-composition queries fall back to full scans).
+Benchmarked on a synthetic Hermes-format database: **500 sessions, 100,000 messages, 260 MB**, with Hermes' indexes applied (they matter: without them, per-session composition queries fall back to full scans).
 
-| Operation | Time (Python 3.14, warm page cache) |
+| Operation | Time (Python 3.14, warm cache) |
 |---|---|
 | `overview(days=30)` — 100k messages | **~1.2 s** |
 | One session detail — 200 messages | **~1–2 ms** |
 | SQL-only scan of all message content | ~0.53 s |
 | 30k tool-call JSON parses | ~0.24 s |
 
-The overview is dominated by SQLite reading message content for token estimates, not
-by Python. A Rust/native rewrite would remove roughly the 0.7 s of Python/JSON work
-while the ~0.5 s of database I/O remains — not worth the packaging cost for a plugin.
-The next real scaling limit is the per-session composition query at thousands of
-sessions; batching that is the optimization to make if it ever matters.
+The overview is dominated by SQLite reading message content for token estimates, not by Python. A Rust/native rewrite would remove roughly the 0.7 s of Python/JSON work while the ~0.5 s of database I/O remains — not worth the packaging cost for a plugin. The next scaling limit is the per-session composition query at thousands of sessions; batching that is the optimization to make if it ever matters.
+
+## Configuration
+
+| Setting | What it does |
+|---|---|
+| `hermes context-lens --db PATH` | Read another profile or a copy of a database. |
+| `CONTEXT_LENS_DB=PATH` | Same override for the dashboard backend, useful for demos and tests. |
+| `--days N` | Window in days; `0` means all time. |
+| `--source telegram` | Filter by platform (`cli`, `telegram`, `discord`, …). |
+| `--all` | Include archived sessions. |
+| `--json` | Emit the report as JSON. |
+
+## Data and accuracy
+
+- **Composition and trend are estimates.** Hermes does not persist a per-request token ledger for historical sessions, so categories use the byte-aware estimate family used by `/context`.
+- **Daily attribution is approximate.** Session totals are distributed across assistant-step timestamps; a session with one API call has one bucket.
+- **Command exit codes are best-effort.** They are parsed from the stored tool result; a tool that never reports one shows as unknown.
+- **Injected memory is not persisted** in the transcript by Hermes, so it is counted only when it appears in a stored message or system prompt.
+- **Archived sessions are excluded by default.** Pass `--all` to include them.
+
+## Development
+
+No build step. Python uses the standard library; the dashboard bundle is plain JavaScript (React comes from the dashboard SDK). PyYAML is used only when present, to read Hermes' model-length cache and config.
+
+```bash
+python -m unittest discover -s tests -v
+hermes plugins doctor . --ci
+hermes plugins validate .
+```
+
+Run the dashboard against another database:
+
+```bash
+CONTEXT_LENS_DB=/path/to/state.db hermes dashboard --port 9123
+```
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a PR, run:
+
+```bash
+python -m unittest discover -s tests -v
+hermes plugins doctor . --ci
+hermes plugins validate .
+```
 
 ## Compatibility
 
 - Hermes Agent **>= 0.22.0** (tested on 0.22.5 / 0.23.0).
-- Uses documented plugin surfaces: `register_cli_command`, `register_command`,
-  the dashboard `manifest.json` + `plugin_api.py` API.
 - Python 3.10+.
+- Uses documented plugin surfaces: `register_cli_command`, `register_command`, the dashboard `manifest.json` + `plugin_api.py` API.
 
 ## Privacy
 
-Everything is local. The plugin has no network calls and no telemetry. The
-JSON output and dashboard necessarily contain session titles, working
-directory paths and command lines — treat exports accordingly.
+Everything is local. The plugin has no network calls and no telemetry. The JSON output and dashboard necessarily contain session titles, working-directory paths and command lines — treat exports accordingly.
 
 ## Credits
 
-- Inspired by [`bowenliang123/dsh-context`](https://github.com/bowenliang123/dsh-context)
-  (Apache-2.0), the context dashboard for DeepSeek Harness. This is an
-  independent Hermes implementation, not a code port.
-- Built for [Hermes Agent](https://github.com/NousResearch/hermes-agent) by
-  Nous Research.
+- Inspired by [`bowenliang123/dsh-context`](https://github.com/bowenliang123/dsh-context) (Apache-2.0), the context dashboard for DeepSeek Harness. This is an independent Hermes implementation, not a code port.
+- Built for [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research.
 
 ## License
 

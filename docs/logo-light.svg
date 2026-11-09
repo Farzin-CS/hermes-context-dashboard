@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="460" height="96" viewBox="0 0 460 96" fill="none">
+  <defs>
+    <linearGradient id="lens" x1="16" y1="16" x2="80" y2="80" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#0EA5E9"/>
+    </linearGradient>
+  </defs>
+  <g>
+    <circle cx="48" cy="48" r="30" stroke="url(#lens)" stroke-width="5"/>
+    <circle cx="48" cy="48" r="12" fill="url(#lens)"/>
+    <path d="M48 22 L48 36 M48 60 L48 74 M22 48 L36 48 M60 48 L74 48" stroke="url(#lens)" stroke-width="3" stroke-linecap="round" opacity="0.55"/>
+    <circle cx="48" cy="48" r="3.5" fill="#FFFFFF"/>
+  </g>
+  <text x="100" y="52" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="32" font-weight="700" fill="#0F172A" letter-spacing="-0.5">Context Lens</text>
+  <text x="101" y="74" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#64748B" letter-spacing="1.4">FOR HERMES AGENT</text>
+</svg>
