@@ -1,0 +1,7 @@
+name: context-lens
+version: 0.1.0
+description: "Context insight for Hermes: token composition, context trends, skills/tools/command activity, and the session fleet — as /lens, `hermes context-lens`, and a dashboard tab."
+author: Farzin
+license: MIT
+requires_hermes: ">=0.22.0"
+homepage: https://github.com/Farzin-CS/hermes-context-lens

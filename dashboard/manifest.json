@@ -1,0 +1,15 @@
+{
+  "name": "context-lens",
+  "label": "Context Lens",
+  "description": "Context insight for Hermes: token composition, context trends, skills/tools/command activity, and the session fleet.",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/context-lens",
+    "position": "after:analytics"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

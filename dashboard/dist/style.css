@@ -1,0 +1,645 @@
+/* Context Lens — dashboard styles. Theme-aware: every chrome color comes from
+   the dashboard's shadcn tokens; the nine --lens-c* vars are data-series colors. */
+
+.lens-root {
+  --lens-c1: #6366f1;
+  --lens-c2: #f59e0b;
+  --lens-c3: #f97316;
+  --lens-c4: #22c55e;
+  --lens-c5: #a855f7;
+  --lens-c6: #3b82f6;
+  --lens-c7: #8b5cf6;
+  --lens-c8: #14b8a6;
+  --lens-c9: #0ea5e9;
+  --lens-system: var(--lens-c1);
+  --lens-tools: var(--lens-c2);
+  --lens-skills: var(--lens-c3);
+  --lens-user: var(--lens-c4);
+  --lens-injected: var(--lens-c5);
+  --lens-assistant: var(--lens-c6);
+  --lens-thinking: var(--lens-c7);
+  --lens-tool_calls: var(--lens-c8);
+  --lens-tool_results: var(--lens-c9);
+  color: var(--color-foreground);
+  padding: 1.25rem 1.5rem 3rem;
+  max-width: 1500px;
+  margin: 0 auto;
+  font-size: 0.875rem;
+}
+
+.lens-root[dir="rtl"] {
+  text-align: right;
+}
+
+.lens-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 1.25rem;
+  flex-wrap: wrap;
+}
+
+.lens-kicker {
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  font-weight: 700;
+  color: var(--color-muted-foreground);
+  margin-bottom: 0.3rem;
+}
+
+.lens-title {
+  font-size: 1.55rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.lens-subtitle {
+  margin: 0.25rem 0 0;
+  color: var(--color-muted-foreground);
+  font-size: 0.82rem;
+}
+
+.lens-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.lens-seg {
+  display: inline-flex;
+  border: 1px solid var(--color-border);
+  border-radius: 0.55rem;
+  padding: 2px;
+  background: var(--color-card);
+}
+
+.lens-seg-btn {
+  border: 0;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+
+.lens-seg-btn:hover { color: var(--color-foreground); }
+
+.lens-seg-btn.is-on {
+  background: var(--color-primary);
+  color: var(--color-primary-foreground, #fff);
+}
+
+.lens-lang {
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  color: var(--color-foreground);
+  font: inherit;
+  font-size: 0.78rem;
+  min-width: 2.4rem;
+  padding: 0.35rem 0.55rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.lens-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.lens-kpis {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.lens-kpi {
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  border-radius: 0.75rem;
+  padding: 0.75rem 0.85rem;
+  min-width: 0;
+}
+
+.lens-kpi-label {
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.lens-kpi-value {
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  margin-top: 0.2rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lens-kpi-hint {
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  margin-top: 0.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lens-section {
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  border-radius: 0.8rem;
+  padding: 0.9rem 1rem;
+  min-width: 0;
+}
+
+.lens-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.7rem;
+}
+
+.lens-section-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.lens-section-hint {
+  margin: 0.1rem 0 0;
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+}
+
+.lens-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 160px;
+  padding-top: 0.35rem;
+}
+
+.lens-bar-slot {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+}
+
+.lens-bar-track {
+  width: 100%;
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  background: color-mix(in srgb, var(--color-border) 45%, transparent);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.lens-bar-fill {
+  width: 100%;
+  background: var(--color-primary);
+  border-radius: 3px 3px 0 0;
+  min-height: 2px;
+  transition: height 180ms ease;
+}
+
+.lens-bar-slot:hover .lens-bar-fill { opacity: 0.75; }
+
+.lens-bar-label {
+  font-size: 0.62rem;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+  height: 0.9rem;
+}
+
+.lens-grid-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.lens-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.lens-donut-wrap {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.lens-donut { flex: 0 0 auto; }
+
+.lens-donut-value {
+  fill: var(--color-foreground);
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.lens-donut-caption {
+  fill: var(--color-muted-foreground);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.lens-legend {
+  flex: 1 1 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 150px;
+}
+
+.lens-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.74rem;
+}
+
+.lens-legend-label {
+  color: var(--color-muted-foreground);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lens-legend-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-foreground);
+}
+
+.lens-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.lens-heatmap {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding-bottom: 0.25rem;
+}
+
+.lens-heat-col {
+  display: grid;
+  grid-template-rows: repeat(7, 13px);
+  gap: 3px;
+  flex: 1 1 0;
+  min-width: 12px;
+}
+
+.lens-heat-cell {
+  background: var(--color-primary);
+  border-radius: 3px;
+  min-height: 12px;
+}
+
+.lens-heat-cell:hover { outline: 1px solid var(--color-ring); }
+
+.lens-list { display: flex; flex-direction: column; gap: 0.34rem; }
+
+.lens-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 8.5rem) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.74rem;
+}
+
+.lens-list-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-foreground);
+}
+
+.lens-list-track {
+  height: 6px;
+  background: color-mix(in srgb, var(--color-border) 50%, transparent);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.lens-list-fill {
+  display: block;
+  height: 100%;
+  background: var(--color-primary);
+  opacity: 0.75;
+  border-radius: 3px;
+}
+
+.lens-list-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.lens-empty {
+  color: var(--color-muted-foreground);
+  font-size: 0.76rem;
+  padding: 0.7rem 0;
+}
+
+.lens-session-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lens-session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 9rem 5.5rem 5rem;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  padding: 0.5rem 0.45rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.lens-session-row:hover { background: color-mix(in srgb, var(--color-primary) 7%, transparent); }
+
+.lens-session-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+
+.lens-session-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+}
+
+.lens-session-meta {
+  color: var(--color-muted-foreground);
+  font-size: 0.66rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lens-session-ctx { display: flex; flex-direction: column; gap: 3px; }
+
+.lens-session-ctx-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--color-border) 55%, transparent);
+  overflow: hidden;
+}
+
+.lens-session-ctx-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--lens-c7);
+  border-radius: 3px;
+}
+
+.lens-session-ctx-label {
+  color: var(--color-muted-foreground);
+  font-size: 0.64rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lens-session-num {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-muted-foreground);
+  text-align: end;
+}
+
+.lens-session-head { display: flex; align-items: flex-start; gap: 0.8rem; }
+
+.lens-back {
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  color: var(--color-foreground);
+  font: inherit;
+  font-size: 0.74rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.lens-session-head-main { min-width: 0; }
+
+.lens-session-head-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 620;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lens-session-head-meta {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+  margin-top: 0.2rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lens-stats {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.lens-stat {
+  border: 1px solid var(--color-border);
+  border-radius: 0.7rem;
+  background: var(--color-card);
+  padding: 0.65rem 0.75rem;
+}
+
+.lens-stat-label {
+  color: var(--color-muted-foreground);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.lens-stat-value { font-size: 1.15rem; font-weight: 640; font-variant-numeric: tabular-nums; }
+.lens-stat-sub { color: var(--color-muted-foreground); font-size: 0.66rem; }
+
+.lens-gauge {
+  height: 10px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--color-border) 55%, transparent);
+  overflow: hidden;
+}
+
+.lens-gauge-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--lens-c9), var(--lens-c7));
+  border-radius: 5px;
+  transition: width 200ms ease;
+}
+
+.lens-gauge-legend {
+  display: flex;
+  justify-content: space-between;
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  margin-top: 0.35rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lens-stack-bar {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--color-border);
+  margin-bottom: 0.75rem;
+}
+
+.lens-stack-seg { display: block; height: 100%; }
+
+.lens-comp-list { display: flex; flex-direction: column; gap: 0.28rem; }
+
+.lens-comp-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) 3.4rem auto;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.73rem;
+}
+
+.lens-comp-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lens-comp-pct { color: var(--color-muted-foreground); text-align: end; font-variant-numeric: tabular-nums; }
+.lens-comp-tokens { color: var(--color-muted-foreground); text-align: end; font-variant-numeric: tabular-nums; font-size: 0.68rem; }
+
+.lens-trend-svg { width: 100%; height: 190px; display: block; }
+.lens-axis-label { fill: var(--color-muted-foreground); font-size: 10px; }
+
+.lens-rows { display: flex; flex-direction: column; gap: 0.28rem; }
+
+.lens-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+  min-width: 0;
+}
+
+.lens-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-foreground);
+}
+
+.lens-row-meta { color: var(--color-muted-foreground); font-size: 0.66rem; white-space: nowrap; }
+.lens-mono { font-family: var(--font-mono, ui-monospace, monospace); }
+.lens-err { color: var(--color-destructive, #ef4444); font-size: 0.66rem; white-space: nowrap; }
+
+.lens-fleet { display: flex; flex-direction: column; gap: 0.35rem; }
+
+.lens-fleet-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.72rem;
+  min-width: 0;
+}
+
+.lens-fleet-button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+.lens-fleet-kind {
+  color: var(--color-muted-foreground);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  flex: 0 0 auto;
+}
+
+.lens-fleet-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.lens-fleet-meta { color: var(--color-muted-foreground); font-size: 0.65rem; white-space: nowrap; }
+
+.lens-timeline { display: flex; flex-direction: column; gap: 0.3rem; }
+
+.lens-timeline-row {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 14rem) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+}
+
+.lens-timeline-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--lens-c7); }
+.lens-timeline-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lens-timeline-detail { color: var(--color-muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lens-timeline-time { color: var(--color-muted-foreground); font-size: 0.64rem; white-space: nowrap; }
+
+.lens-error {
+  border: 1px solid var(--color-destructive, #ef4444);
+  background: color-mix(in srgb, var(--color-destructive, #ef4444) 8%, transparent);
+  color: var(--color-foreground);
+  border-radius: 0.6rem;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.8rem;
+  font-size: 0.78rem;
+}
+
+.lens-loading { color: var(--color-muted-foreground); padding: 2rem 0; }
+
+.lens-foot {
+  margin-top: 1.5rem;
+  padding-top: 0.75rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.66rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+@media (max-width: 1150px) {
+  .lens-kpis, .lens-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .lens-grid-3 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+
+@media (max-width: 780px) {
+  .lens-root { padding: 1rem; }
+  .lens-kpis, .lens-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lens-grid-2, .lens-grid-3 { grid-template-columns: minmax(0, 1fr); }
+  .lens-session-row { grid-template-columns: minmax(0, 1fr) 7rem; }
+  .lens-session-row .lens-session-num { display: none; }
+  .lens-donut-wrap { justify-content: center; }
+}
