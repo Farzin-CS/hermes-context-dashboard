@@ -340,6 +340,12 @@ def _iso(ts: float | None) -> str:
         return ""
 
 
+def _chunks(values: list[str], size: int = 500):
+    """Yield id chunks so an IN(...) never crosses SQLite's variable cap."""
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
 def _clean_title(title: str | None) -> str:
     text = " ".join(str(title or "").split())
     return text[:120]
@@ -604,7 +610,6 @@ class Analyzer:
         if not ids:
             return self._empty_overview(range_days, source, now)
 
-        placeholders = ",".join("?" for _ in ids)
         cutoff = now - range_days * 86400 if range_days else 0.0
 
         # ---- per-message timestamps for daily attribution -----------------
@@ -613,34 +618,36 @@ class Analyzer:
         tool_ts: dict[str, list[float]] = defaultdict(list)
         active_ms: dict[str, int] = defaultdict(int)
         last_ts: dict[str, float] = {}
-        for msg in self.conn.execute(
-            f"SELECT session_id, role, timestamp FROM messages "
-            f"WHERE session_id IN ({placeholders}) AND role IN ('user','assistant','tool') "
-            "ORDER BY session_id, id",
-            ids,
-        ):
-            ts = float(msg["timestamp"] or 0)
-            if ts <= 0:
-                continue
-            sid = msg["session_id"]
-            if msg["role"] == "assistant":
-                assistant_ts[sid].append(ts)
-            elif msg["role"] == "user":
-                user_ts[sid].append(ts)
-            else:
-                tool_ts[sid].append(ts)
-            if cutoff and ts < cutoff:
-                continue
-            prev = last_ts.get(sid)
-            if prev:
-                gap = ts - prev
-                if 0 < gap <= 300:
-                    active_ms[sid] += int(gap * 1000)
-                elif gap > 300:
+        for chunk in _chunks(ids):
+            ph = ",".join("?" for _ in chunk)
+            for msg in self.conn.execute(
+                f"SELECT session_id, role, timestamp FROM messages "
+                f"WHERE session_id IN ({ph}) AND role IN ('user','assistant','tool') "
+                "ORDER BY session_id, id",
+                chunk,
+            ):
+                ts = float(msg["timestamp"] or 0)
+                if ts <= 0:
+                    continue
+                sid = msg["session_id"]
+                if msg["role"] == "assistant":
+                    assistant_ts[sid].append(ts)
+                elif msg["role"] == "user":
+                    user_ts[sid].append(ts)
+                else:
+                    tool_ts[sid].append(ts)
+                if cutoff and ts < cutoff:
+                    continue
+                prev = last_ts.get(sid)
+                if prev:
+                    gap = ts - prev
+                    if 0 < gap <= 300:
+                        active_ms[sid] += int(gap * 1000)
+                    elif gap > 300:
+                        active_ms[sid] += 60_000
+                else:
                     active_ms[sid] += 60_000
-            else:
-                active_ms[sid] += 60_000
-            last_ts[sid] = ts
+                last_ts[sid] = ts
 
         # ---- ledger: skills / commands / files ----------------------------
         skill_counts: Counter[str] = Counter()
@@ -649,63 +656,67 @@ class Analyzer:
         cmd_last: dict[str, float] = {}
         file_counts: dict[str, dict[str, int]] = defaultdict(lambda: {"read": 0, "write": 0, "edit": 0, "touches": 0})
         tool_names_by_call: dict[str, str] = {}
-        for row in self.conn.execute(
-            f"SELECT session_id, timestamp, tool_calls FROM messages "
-            f"WHERE session_id IN ({placeholders}) AND role = 'assistant' "
-            "AND tool_calls IS NOT NULL AND tool_calls != ''",
-            ids,
-        ):
-            ts = float(row["timestamp"] or 0)
-            if cutoff and ts < cutoff:
-                continue
-            for name, args, call_id in iter_tool_calls(row["tool_calls"]):
-                if call_id:
-                    tool_names_by_call[call_id] = name
-                if name == "skill_view":
-                    skill = str(args.get("name") or "").strip()
-                    if skill:
-                        skill_counts[skill] += 1
-                        skill_last[skill] = max(skill_last.get(skill, 0), ts)
-                elif name in SHELL_TOOLS:
-                    command = str(args.get("command") or "")
-                    program = _first_program(command)
-                    if program:
-                        cmd_counts[program] += 1
-                        cmd_last[program] = max(cmd_last.get(program, 0), ts)
-                elif name in CODE_TOOLS:
-                    cmd_counts["python (code)"] += 1
-                    cmd_last["python (code)"] = max(cmd_last.get("python (code)", 0), ts)
-                path = str(args.get("path") or args.get("file") or "").strip()
-                if path:
-                    entry = file_counts[path]
-                    if name in FILE_READ_TOOLS:
-                        entry["read"] += 1
-                        entry["touches"] += 1
-                    elif name in FILE_WRITE_TOOLS:
-                        entry["write"] += 1
-                        entry["touches"] += 1
-                    elif name in FILE_EDIT_TOOLS:
-                        entry["edit"] += 1
-                        entry["touches"] += 1
+        for chunk in _chunks(ids):
+            ph = ",".join("?" for _ in chunk)
+            for row in self.conn.execute(
+                f"SELECT session_id, timestamp, tool_calls FROM messages "
+                f"WHERE session_id IN ({ph}) AND role = 'assistant' "
+                "AND tool_calls IS NOT NULL AND tool_calls != ''",
+                chunk,
+            ):
+                ts = float(row["timestamp"] or 0)
+                if cutoff and ts < cutoff:
+                    continue
+                for name, args, call_id in iter_tool_calls(row["tool_calls"]):
+                    if call_id:
+                        tool_names_by_call[call_id] = name
+                    if name == "skill_view":
+                        skill = str(args.get("name") or "").strip()
+                        if skill:
+                            skill_counts[skill] += 1
+                            skill_last[skill] = max(skill_last.get(skill, 0), ts)
+                    elif name in SHELL_TOOLS:
+                        command = str(args.get("command") or "")
+                        program = _first_program(command)
+                        if program:
+                            cmd_counts[program] += 1
+                            cmd_last[program] = max(cmd_last.get(program, 0), ts)
+                    elif name in CODE_TOOLS:
+                        cmd_counts["python (code)"] += 1
+                        cmd_last["python (code)"] = max(cmd_last.get("python (code)", 0), ts)
+                    path = str(args.get("path") or args.get("file") or "").strip()
+                    if path:
+                        entry = file_counts[path]
+                        if name in FILE_READ_TOOLS:
+                            entry["read"] += 1
+                            entry["touches"] += 1
+                        elif name in FILE_WRITE_TOOLS:
+                            entry["write"] += 1
+                            entry["touches"] += 1
+                        elif name in FILE_EDIT_TOOLS:
+                            entry["edit"] += 1
+                            entry["touches"] += 1
 
         # ---- tool execution counts + errors -------------------------------
         tool_counts: Counter[str] = Counter()
         tool_errors: Counter[str] = Counter()
         tool_last: dict[str, float] = {}
         result_by_call: dict[str, str] = {}
-        for row in self.conn.execute(
-            f"SELECT tool_call_id, tool_name, content, timestamp FROM messages "
-            f"WHERE session_id IN ({placeholders}) AND role = 'tool'",
-            ids,
-        ):
-            ts = float(row["timestamp"] or 0)
-            if cutoff and ts < cutoff:
-                continue
-            name = row["tool_name"] or "unknown"
-            tool_counts[name] += 1
-            tool_last[name] = max(tool_last.get(name, 0), ts)
-            if row["tool_call_id"]:
-                result_by_call[row["tool_call_id"]] = row["content"] or ""
+        for chunk in _chunks(ids):
+            ph = ",".join("?" for _ in chunk)
+            for row in self.conn.execute(
+                f"SELECT tool_call_id, tool_name, content, timestamp FROM messages "
+                f"WHERE session_id IN ({ph}) AND role = 'tool'",
+                chunk,
+            ):
+                ts = float(row["timestamp"] or 0)
+                if cutoff and ts < cutoff:
+                    continue
+                name = row["tool_name"] or "unknown"
+                tool_counts[name] += 1
+                tool_last[name] = max(tool_last.get(name, 0), ts)
+                if row["tool_call_id"]:
+                    result_by_call[row["tool_call_id"]] = row["content"] or ""
         for call_id, name in tool_names_by_call.items():
             code = _exit_code_from_result(result_by_call.get(call_id))
             if code not in (None, 0):
