@@ -167,6 +167,25 @@ Run the dashboard against another database (handy for demos or tests):
 CONTEXT_LENS_DB=/path/to/state.db hermes dashboard --port 9123
 ```
 
+## Performance
+
+Benchmarked on a synthetic Hermes-format database: **500 sessions, 100,000 messages,
+260 MB**, with Hermes' own indexes applied (they matter: without them the per-session
+composition queries fall back to full scans).
+
+| Operation | Time (Python 3.14, warm page cache) |
+|---|---|
+| `overview(days=30)` — 100k messages | **~1.2 s** |
+| One session detail — 200 messages | **~1–2 ms** |
+| SQL-only scan of all message content | ~0.53 s |
+| 30k tool-call JSON parses | ~0.24 s |
+
+The overview is dominated by SQLite reading message content for token estimates, not
+by Python. A Rust/native rewrite would remove roughly the 0.7 s of Python/JSON work
+while the ~0.5 s of database I/O remains — not worth the packaging cost for a plugin.
+The next real scaling limit is the per-session composition query at thousands of
+sessions; batching that is the optimization to make if it ever matters.
+
 ## Compatibility
 
 - Hermes Agent **>= 0.22.0** (tested on 0.22.5 / 0.23.0).
