@@ -240,7 +240,7 @@ hermes plugins validate .
 - Hermes Agent **>= 0.22.0** (tested on 0.22.5 / 0.23.0).
 - Python 3.10+.
 - Uses documented plugin surfaces: `register_cli_command`, `register_command`, the dashboard `manifest.json` + `plugin_api.py` API.
-- The Persian tab follows the dashboard locale. If your Hermes build does not list فارسی in the global picker yet, the dashboard still works in English; the plugin itself needs no separate language setting. An optional core patch for the global Persian locale and the Nous Blue terminal is in [`patches/`](patches/README.md).
+- The Persian tab follows the dashboard locale. If your Hermes build does not list فارسی in the global picker yet, the dashboard still works in English; the plugin itself needs no separate language setting. An optional core patch for the global Persian locale, the Nous Blue terminal, and the chat attachment bar is in [`patches/`](patches/README.md).
 
 ## Privacy
 

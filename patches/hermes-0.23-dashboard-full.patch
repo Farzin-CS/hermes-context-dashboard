@@ -1,0 +1,1420 @@
+diff --git a/apps/shared/src/i18n.ts b/apps/shared/src/i18n.ts
+index a4f59181bb..b19da8bd4c 100644
+--- a/apps/shared/src/i18n.ts
++++ b/apps/shared/src/i18n.ts
+@@ -173,6 +173,7 @@ export const LOCALE_ENDONYMS = {
+   de: 'Deutsch',
+   en: 'English',
+   es: 'Español',
++  fa: 'فارسی',
+   fr: 'Français',
+   ga: 'Gaeilge',
+   hu: 'Magyar',
+@@ -191,7 +192,7 @@ export type EndonymLocale = keyof typeof LOCALE_ENDONYMS
+ 
+ /** Locales whose script flows right-to-left; drives `<html dir>` so Tailwind's
+  *  logical utilities (ms-/me-, ps-/pe-) flip. */
+-export const RTL_LOCALES: ReadonlySet<string> = new Set<EndonymLocale>(['ar'])
++export const RTL_LOCALES: ReadonlySet<string> = new Set<EndonymLocale>(['ar', 'fa'])
+ 
+ /** Mirror the active locale onto `<html lang dir>`. No-op without a document
+  *  (SSR, tests). `rtl` lets a registry that knows more locales than
+diff --git a/hermes_cli/web_routers/files.py b/hermes_cli/web_routers/files.py
+index 9f2e5e3b9b..831a07eea9 100644
+--- a/hermes_cli/web_routers/files.py
++++ b/hermes_cli/web_routers/files.py
+@@ -32,7 +32,8 @@ from hermes_cli._subprocess_compat import windows_hide_flags
+ from hermes_cli.home_data_layout import SECRET_CACHE_STORES
+ from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+ from hermes_cli.staged_uploads import (
+-    ensure_profile_subdir, is_staged_upload, removed_on_failure, resolve_upload_home,
++    ensure_profile_subdir, is_staged_upload, publish_staged_upload, removed_on_failure,
++    resolve_upload_home, staged_upload_descriptor,
+ )
+ from hermes_cli.web_deps import late
+ from hermes_cli.web_server_remote_media import remote_media_response
+@@ -565,6 +566,45 @@ def _decode_chat_image_upload(payload: ChatImageUpload) -> tuple[bytes, str, str
+     return data, mime_type, ext
+ 
+ 
++@router.post("/api/chat/dashboard-file-upload")
++async def upload_dashboard_chat_file(
++    file: UploadFile = File(...),
++    profile: Optional[str] = None,
++):
++    """Stage a file picked in the dashboard chat composer.
++
++    The Webapp-only ``/api/chat/file-upload`` route is intentionally absent on
++    the standalone dashboard surface. The embedded TUI chat still needs a
++    browser-picked file to reach the agent, so this dashboard-scoped route
++    publishes the bytes under the active profile's ``uploads/`` directory and
++    returns the path the composer types as ``[User attached file: …]``.
++    """
++    from hermes_constants import WEBAPP_ATTACHMENT_MAX_BYTES
++
++    profile_home = await asyncio.to_thread(resolve_upload_home, profile)
++    try:
++        total = await asyncio.to_thread(file.file.seek, 0, os.SEEK_END)
++        if total > WEBAPP_ATTACHMENT_MAX_BYTES:
++            cap_mib = WEBAPP_ATTACHMENT_MAX_BYTES // (1024 * 1024)
++            raise HTTPException(
++                status_code=413,
++                detail=f"File is too large; cap is {cap_mib} MiB",
++            )
++        target = await asyncio.to_thread(
++            publish_staged_upload,
++            file.file,
++            profile_home,
++            file.filename or "attachment",
++        )
++    finally:
++        await file.close()
++
++    result = {"ok": True, "path": str(target), "size": total}
++    if descriptor := await asyncio.to_thread(staged_upload_descriptor, target, profile_home):
++        result["staged_upload"] = descriptor
++    return result
++
++
+ @router.post("/api/chat/image-upload")
+ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = None):
+     """Persist a browser clipboard image where the embedded TUI can read it.
+diff --git a/hermes_cli/web_upload_limit.py b/hermes_cli/web_upload_limit.py
+index 0e8dcdbae4..c16cdd1289 100644
+--- a/hermes_cli/web_upload_limit.py
++++ b/hermes_cli/web_upload_limit.py
+@@ -21,16 +21,21 @@ CHAT_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+ CHAT_IMAGE_BODY_MAX_BYTES = 4 * -(-CHAT_IMAGE_MAX_BYTES // 3) + 64 * 1024
+ 
+ _BODY_MAX_BYTES = {
++    "/api/chat/dashboard-file-upload": CHAT_FILE_BODY_MAX_BYTES,
+     "/api/chat/file-upload": CHAT_FILE_BODY_MAX_BYTES,
+     "/api/chat/image-upload": CHAT_IMAGE_BODY_MAX_BYTES,
+ }
+ 
++# The dashboard chat has its own upload route (the Webapp's route is absent on
++# that surface); its body cap applies regardless of the browser_files policy.
++_DASHBOARD_FILE_UPLOAD = "/api/chat/dashboard-file-upload"
++
+ 
+ class ChatFileUploadLimitMiddleware:
+     """Refuse a chat file or image upload with 413 once its body passes the route's cap: at once
+-    when Content-Length declares more, else at the first chunk past it. Only on the surfaces whose
+-    policy serves the browser's file routes (the Webapp); elsewhere uploads reach their handlers
+-    as on main."""
++    when Content-Length declares more, else at the first chunk past it. The Webapp-only routes
++    apply only where the surface's policy serves browser files; the dashboard's own chat upload
++    is capped on every surface that serves it."""
+ 
+     def __init__(self, app: ASGIApp):
+         self.app = app
+@@ -42,7 +47,8 @@ class ChatFileUploadLimitMiddleware:
+             path = path[len(root) :]
+         body_max = _BODY_MAX_BYTES.get(path)
+         if (scope["type"] != "http" or scope["method"] != "POST" or body_max is None
+-                or not policy(getattr(scope.get("app"), "state", None)).browser_files):
++                or (path != _DASHBOARD_FILE_UPLOAD
++                    and not policy(getattr(scope.get("app"), "state", None)).browser_files)):
+             await self.app(scope, receive, send)
+             return
+ 
+diff --git a/tests/hermes_cli/test_web_server_surface.py b/tests/hermes_cli/test_web_server_surface.py
+index 0c2a481ff3..645ac001d2 100644
+--- a/tests/hermes_cli/test_web_server_surface.py
++++ b/tests/hermes_cli/test_web_server_surface.py
+@@ -6,14 +6,16 @@ policy (``hermes_cli.web_server_surface``) says which of them serve:
+ 
+ - ``/api/webapp-access/*``: native Desktop's Web Access pane, which calls the gateway's own listener
+   (the private one, or the Webapp's when it is on);
+-- the browser's file routes, ``/api/chat/file-upload`` and ``/api/files/ticket``, and the cap on chat
+-  upload bodies before they are parsed: the Webapp only.
++- the browser's Webapp-only file routes, ``/api/chat/file-upload`` and ``/api/files/ticket``, and the cap on chat
++  upload bodies before they are parsed: the Webapp only. The dashboard chat's own
++  ``/api/chat/dashboard-file-upload`` route is separate and is capped on every surface that serves it.
+ 
+ Everywhere else these routes answer 404 before their handlers run, and chat uploads reach their
+ handlers as on main.
+ """
+ from __future__ import annotations
+ 
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -127,3 +129,58 @@ def test_chat_upload_bodies_are_capped_before_parsing_only_on_the_webapp(surface
+ 
+     assert reached == ([] if capped else ["/api/chat/image-upload"])
+     assert [m["status"] for m in sent if m["type"] == "http.response.start"] == ([413] if capped else [])
++
++
++def test_the_dashboard_chat_can_stage_a_file():
++    """The embedded dashboard chat uploads non-image files through its own route.
++
++    The Webapp-only ``/api/chat/file-upload`` stays absent on the dashboard
++    surface; the dashboard composer uses this separate staging route so the
++    agent can read a picked file alongside the prompt.
++    """
++    client = _owner_client()
++    response = client.post(
++        "/api/chat/dashboard-file-upload",
++        files={"file": ("note.txt", b"hello")},
++    )
++    assert response.status_code == 200
++    staged = Path(response.json()["path"])
++    try:
++        assert staged.read_bytes() == b"hello"
++    finally:
++        staged.unlink(missing_ok=True)
++        try:
++            staged.parent.rmdir()
++        except OSError:
++            pass
++
++
++def test_the_dashboard_chat_upload_body_is_capped_before_parsing():
++    """The dashboard's own upload route is capped even though browser_files is off."""
++    import asyncio
++
++    from hermes_cli.web_upload_limit import CHAT_FILE_BODY_MAX_BYTES, ChatFileUploadLimitMiddleware
++
++    reached, sent = [], []
++
++    async def handler(scope, receive, send):
++        reached.append(scope["path"])
++
++    async def receive():
++        return {"type": "http.request", "body": b"", "more_body": False}
++
++    async def send(message):
++        sent.append(message)
++
++    scope = {
++        "type": "http",
++        "method": "POST",
++        "path": "/api/chat/dashboard-file-upload",
++        "root_path": "",
++        "headers": [(b"content-length", str(CHAT_FILE_BODY_MAX_BYTES + 1).encode())],
++        "app": SimpleNamespace(state=SimpleNamespace(ui_surface="dashboard")),
++    }
++    asyncio.run(ChatFileUploadLimitMiddleware(handler)(scope, receive, send))
++
++    assert reached == []
++    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 49b23a4037..5342dc2f3c 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -192,7 +192,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
+     label: "Sessions",
+     icon: MessageSquare,
+   },
+-  { path: "/files", label: "Files", icon: FolderOpen },
++  { path: "/files", labelKey: "files", label: "Files", icon: FolderOpen },
+   {
+     path: "/analytics",
+     labelKey: "analytics",
+@@ -209,14 +209,14 @@ const BUILTIN_NAV_REST: NavItem[] = [
+   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
+   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
+   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
+-  { path: "/mcp", label: "MCP", icon: Plug },
+-  { path: "/channels", label: "Channels", icon: Radio },
+-  { path: "/webhooks", label: "Webhooks", icon: Webhook },
+-  { path: "/pairing", label: "Pairing", icon: ShieldCheck },
++  { path: "/mcp", labelKey: "mcp", label: "MCP", icon: Plug },
++  { path: "/channels", labelKey: "channels", label: "Channels", icon: Radio },
++  { path: "/webhooks", labelKey: "webhooks", label: "Webhooks", icon: Webhook },
++  { path: "/pairing", labelKey: "pairing", label: "Pairing", icon: ShieldCheck },
+   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
+   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
+   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
+-  { path: "/system", label: "System", icon: Wrench },
++  { path: "/system", labelKey: "system", label: "System", icon: Wrench },
+   {
+     path: "/docs",
+     labelKey: "documentation",
+diff --git a/web/src/components/ChatAttachmentBar.tsx b/web/src/components/ChatAttachmentBar.tsx
+new file mode 100644
+index 0000000000..bedad88ddf
+--- /dev/null
++++ b/web/src/components/ChatAttachmentBar.tsx
+@@ -0,0 +1,287 @@
++import { Button } from "@nous-research/ui/ui/components/button";
++import {
++  AlertCircle,
++  FileText,
++  Image as ImageIcon,
++  Loader2,
++  Paperclip,
++  X,
++} from "lucide-react";
++import { useEffect, useRef, useState, type ChangeEvent } from "react";
++
++import { useI18n } from "@/i18n";
++import { uploadChatFile } from "@/lib/chat-file-upload";
++import { uploadChatImage } from "@/lib/chatImagePaste";
++import {
++  type ChatAttachment,
++  type ChatAttachmentKind,
++} from "@/lib/chat-attachments";
++import { cn } from "@/lib/utils";
++
++interface BarCopy {
++  attach: string;
++  uploading: string;
++  uploadFailed: string;
++  remove: string;
++  hint: string;
++  notConnected: string;
++  tooLarge: string;
++  attached: string;
++}
++
++type PendingStatus = "uploading" | "ready" | "error";
++
++const FALLBACK_COPY: BarCopy = {
++  attach: "Attach files",
++  uploading: "Uploading…",
++  uploadFailed: "Upload failed",
++  remove: "Remove",
++  hint: "Attach files, then type your prompt in the terminal and press Enter.",
++  notConnected: "Chat is not connected.",
++  tooLarge: "File is too large (max {mb} MB).",
++  attached: "attached",
++};
++
++interface PendingAttachment extends ChatAttachment {
++  file: File;
++  status: PendingStatus;
++  error?: string;
++}
++
++export interface ChatAttachmentBarProps {
++  profile?: string;
++  connected: boolean;
++  resetKey?: number;
++  onFilesChange: (files: ChatAttachment[]) => void;
++  onImagesReady: (
++    images: { path: string; name: string }[],
++  ) => Promise<void> | void;
++}
++
++const MAX_FILE_BYTES = 16 * 1024 * 1024;
++const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
++
++function newId(): string {
++  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
++    return crypto.randomUUID();
++  }
++  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
++}
++
++function isImageFile(file: File): boolean {
++  const type = file.type.toLowerCase();
++  // Keep this list in sync with chatImagePaste's IMAGE_MIME_EXT. Types the
++  // /image endpoint does not accept (SVG, AVIF, HEIC, TIFF) fall back to a
++  // generic file attachment instead of failing the upload.
++  return (
++    type === "image/png" ||
++    type === "image/jpeg" ||
++    type === "image/jpg" ||
++    type === "image/gif" ||
++    type === "image/webp" ||
++    type === "image/bmp" ||
++    (!type && /\.(bmp|gif|jpe?g|png|webp)$/i.test(file.name))
++  );
++}
++
++function formatBytes(bytes: number): string {
++  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
++}
++
++function errorText(err: unknown): string {
++  return err instanceof Error ? err.message : String(err);
++}
++
++export function ChatAttachmentBar({
++  profile = "",
++  connected,
++  resetKey = 0,
++  onFilesChange,
++  onImagesReady,
++}: ChatAttachmentBarProps) {
++  const { t } = useI18n();
++  const copy: BarCopy = t.app.chatComposer ?? FALLBACK_COPY;
++  const [items, setItems] = useState<PendingAttachment[]>([]);
++  const [error, setError] = useState<string | null>(null);
++  const inputRef = useRef<HTMLInputElement | null>(null);
++  const aliveRef = useRef(true);
++
++  useEffect(() => {
++    aliveRef.current = true;
++    return () => {
++      aliveRef.current = false;
++    };
++  }, []);
++
++  // The Enter handler in ChatPage consumes the ready files and bumps this
++  // key; drop their chips once the prompt has been submitted.
++  useEffect(() => {
++    setItems([]);
++    setError(null);
++  }, [resetKey]);
++
++  const updateItem = (id: string, patch: Partial<PendingAttachment>) => {
++    setItems((current) =>
++      current.map((item) => (item.id === id ? { ...item, ...patch } : item)),
++    );
++  };
++
++  // Keep ChatPage's Enter handler in sync with the ready file attachments.
++  useEffect(() => {
++    onFilesChange(
++      items
++        .filter((item) => item.kind === "file" && item.status === "ready")
++        .map(({ id, name, path, kind, size }) => ({
++          id,
++          name,
++          path,
++          kind,
++          size,
++        })),
++    );
++  }, [items, onFilesChange]);
++
++  const addFiles = async (picked: File[]) => {
++    if (!picked.length) return;
++    setError(null);
++    const queued: PendingAttachment[] = picked.map((file) => ({
++      id: newId(),
++      file,
++      name: file.name || "attachment",
++      path: "",
++      kind: (isImageFile(file) ? "image" : "file") as ChatAttachmentKind,
++      size: file.size,
++      status: "uploading",
++    }));
++    setItems((current) => [...current, ...queued]);
++
++    for (const item of queued) {
++      try {
++        if (!item.file.size) throw new Error("file is empty");
++        if (item.kind === "image") {
++          if (item.size > MAX_IMAGE_BYTES) {
++            throw new Error(copy.tooLarge.replace("{mb}", "25"));
++          }
++          const uploaded = await uploadChatImage(item.file, profile);
++          if (!aliveRef.current) return;
++          updateItem(item.id, { path: uploaded.path, status: "ready" });
++          await onImagesReady([{ path: uploaded.path, name: item.name }]);
++        } else {
++          if (item.size > MAX_FILE_BYTES) {
++            throw new Error(copy.tooLarge.replace("{mb}", "16"));
++          }
++          const uploaded = await uploadChatFile(item.file, profile);
++          if (!aliveRef.current) return;
++          updateItem(item.id, { path: uploaded.path, status: "ready" });
++        }
++      } catch (err) {
++        if (!aliveRef.current) return;
++        const message = errorText(err);
++        updateItem(item.id, { status: "error", error: message });
++        setError(`${copy.uploadFailed}: ${message}`);
++      }
++    }
++  };
++
++  const handlePicked = (event: ChangeEvent<HTMLInputElement>) => {
++    const files = Array.from(event.target.files ?? []);
++    // Allow picking the same file again after removing it.
++    event.target.value = "";
++    void addFiles(files);
++  };
++
++  const remove = (id: string) => {
++    setItems((current) => current.filter((item) => item.id !== id));
++    setError(null);
++  };
++
++  return (
++    <div className="flex shrink-0 flex-col gap-2 rounded-lg border border-current/15 bg-background-base/60 p-2">
++      {items.length > 0 && (
++        <div className="flex flex-wrap gap-1.5">
++          {items.map((item) => {
++            const Icon = item.kind === "image" ? ImageIcon : FileText;
++            const removable = item.kind === "file" || item.status === "error";
++            return (
++              <span
++                key={item.id}
++                title={item.error || item.name}
++                className={cn(
++                  "inline-flex max-w-full items-center gap-1.5 rounded border px-2 py-1 text-xs",
++                  item.status === "error"
++                    ? "border-destructive/50 text-destructive"
++                    : "border-current/20 text-current/80",
++                )}
++              >
++                <Icon className="h-3.5 w-3.5 shrink-0" />
++                <span className="max-w-[14rem] truncate">{item.name}</span>
++                <span className="shrink-0 text-current/50">
++                  {formatBytes(item.size)}
++                </span>
++                {item.status === "uploading" && (
++                  <Loader2
++                    className="h-3.5 w-3.5 shrink-0 animate-spin"
++                    aria-label={copy.uploading}
++                  />
++                )}
++                {item.status === "error" && (
++                  <AlertCircle className="h-3.5 w-3.5 shrink-0" />
++                )}
++                {item.status === "ready" && item.kind === "image" && (
++                  <span className="shrink-0 text-current/50">
++                    {copy.attached}
++                  </span>
++                )}
++                {removable && (
++                  <button
++                    type="button"
++                    onClick={() => remove(item.id)}
++                    aria-label={`${copy.remove} ${item.name}`}
++                    title={copy.remove}
++                    className="shrink-0 rounded p-0.5 hover:bg-current/10"
++                  >
++                    <X className="h-3.5 w-3.5" />
++                  </button>
++                )}
++              </span>
++            );
++          })}
++        </div>
++      )}
++
++      <div className="flex flex-wrap items-center gap-2">
++        <input
++          ref={inputRef}
++          type="file"
++          multiple
++          className="hidden"
++          onChange={handlePicked}
++          data-testid="chat-attachment-input"
++        />
++        <Button
++          ghost
++          size="sm"
++          onClick={() => inputRef.current?.click()}
++          aria-label={copy.attach}
++          title={copy.attach}
++          className="gap-1.5"
++        >
++          <Paperclip className="h-4 w-4" />
++          <span>{copy.attach}</span>
++        </Button>
++        <span className="text-xs text-muted-foreground">
++          {connected ? copy.hint : copy.notConnected}
++        </span>
++      </div>
++
++      {error && (
++        <div role="alert" className="text-xs text-destructive">
++          {error}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/i18n/context.tsx b/web/src/i18n/context.tsx
+index e407988edf..a649670c78 100644
+--- a/web/src/i18n/context.tsx
++++ b/web/src/i18n/context.tsx
+@@ -7,6 +7,7 @@ import { zhHant } from "./zh-hant";
+ import { ja } from "./ja";
+ import { de } from "./de";
+ import { es } from "./es";
++import { fa } from "./fa";
+ import { fr } from "./fr";
+ import { tr } from "./tr";
+ import { uk } from "./uk";
+@@ -26,6 +27,7 @@ const TRANSLATIONS: Record<Locale, Translations> = {
+   ja,
+   de,
+   es,
++  fa,
+   fr,
+   tr,
+   uk,
+diff --git a/web/src/i18n/en.ts b/web/src/i18n/en.ts
+index 67a30deffd..b4fb1b0594 100644
+--- a/web/src/i18n/en.ts
++++ b/web/src/i18n/en.ts
+@@ -86,9 +86,25 @@ export const en: Translations = {
+       plugins: "Plugins",
+       sessions: "Sessions",
+       skills: "Skills",
++      files: "Files",
++      mcp: "MCP",
++      channels: "Channels",
++      webhooks: "Webhooks",
++      pairing: "Pairing",
++      system: "System",
+     },
+-    modelToolsSheetSubtitle: "& tools",
+     modelToolsSheetTitle: "Model",
++    modelToolsSheetSubtitle: "& tools",
++    chatComposer: {
++      attach: "Attach files",
++      uploading: "Uploading…",
++      uploadFailed: "Upload failed",
++      remove: "Remove",
++      hint: "Attach files, then type your prompt in the terminal and press Enter.",
++      notConnected: "Chat is not connected.",
++      tooLarge: "File is too large (max {mb} MB).",
++      attached: "attached",
++    },
+     navigation: "Navigation",
+     openDocumentation: "Open documentation in a new tab",
+     openNavigation: "Open navigation",
+diff --git a/web/src/i18n/fa.ts b/web/src/i18n/fa.ts
+new file mode 100644
+index 0000000000..c4d57960db
+--- /dev/null
++++ b/web/src/i18n/fa.ts
+@@ -0,0 +1,466 @@
++import { defineLocale } from "./define-locale";
++
++/**
++ * Persian (fa) dashboard locale.
++ *
++ * Partial on purpose: every untranslated key falls back to English via
++ * `defineLocale`. The shell, navigation, session/analytics pages and the
++ * Context Lens tab are translated; deeper settings pages fill in over time.
++ */
++export const fa = defineLocale({
++  common: {
++    save: "ذخیره",
++    saving: "در حال ذخیره…",
++    cancel: "انصراف",
++    close: "بستن",
++    confirm: "تأیید",
++    delete: "حذف",
++    refresh: "تازه‌سازی",
++    retry: "تلاش دوباره",
++    loadFailed: "بارگذاری {what} ممکن نشد. مطمئن شوید سرور داشبورد در حال اجراست و روی تلاش دوباره بزنید.",
++    loadFailedDetails: "جزئیات: {detail}",
++    search: "جستجو…",
++    loading: "در حال بارگذاری…",
++    create: "ایجاد",
++    creating: "در حال ایجاد…",
++    set: "تنظیم",
++    replace: "جایگزینی",
++    clear: "پاک‌کردن",
++    live: "زنده",
++    off: "خاموش",
++    enabled: "فعال",
++    disabled: "غیرفعال",
++    active: "فعال",
++    inactive: "غیرفعال",
++    unknown: "نامشخص",
++    untitled: "بدون عنوان",
++    none: "هیچ",
++    form: "فرم",
++    noResults: "نتیجه‌ای نیست",
++    of: "از",
++    page: "صفحه",
++    msgs: "پیام",
++    tools: "ابزار",
++    match: "تطابق",
++    other: "دیگر",
++    configured: "پیکربندی‌شده",
++    removed: "حذف‌شده",
++    failedToToggle: "تغییر وضعیت ناموفق بود",
++    failedToRemove: "حذف ناموفق بود",
++    failedToReveal: "نمایش ناموفق بود",
++    collapse: "جمع‌کردن",
++    expand: "بازکردن",
++    general: "عمومی",
++    messaging: "پیام‌رسانی",
++    gateway: "گیتوی",
++    gatewayHint:
++      "پلتفرم‌های پیام‌رسانی، سرور API و وب‌هوک‌ها در صفحه کانال‌ها پیکربندی می‌شوند. این‌ها تنظیمات سراسری گیتوی هستند.",
++    pluginLoadFailed: "بارگذاری اسکریپت این پلاگین ممکن نشد. تب Network و مسیر پلاگین سرور را بررسی کنید.",
++    pluginNotRegistered: "اسکریپت پلاگین register() را صدا نزده یا خطا داده است. کنسول مرورگر را باز کنید.",
++  },
++
++  app: {
++    brand: "Hermes Agent",
++    brandShort: "HA",
++    closeNavigation: "بستن ناوبری",
++    closeModelTools: "بستن مدل و ابزارها",
++    footer: { org: "Nous Research" },
++    activeSessionsLabel: "نشست‌های فعال:",
++    gatewayStatusLabel: "وضعیت گیتوی:",
++    gatewayStrip: {
++      degraded: "کاهش کیفیت",
++      failed: "شروع ناموفق",
++      heartbeatStale: "ضربان قدیمی",
++      off: "خاموش",
++      running: "در حال اجرا",
++      starting: "در حال شروع",
++      stopped: "متوقف",
++    },
++    nav: {
++      analytics: "تحلیل",
++      chat: "گفتگو",
++      config: "تنظیمات",
++      cron: "زمان‌بندی",
++      documentation: "مستندات",
++      keys: "کلیدها",
++      logs: "گزارش‌ها",
++      models: "مدل‌ها",
++      profiles: "پروفایل‌ها",
++      plugins: "پلاگین‌ها",
++      sessions: "نشست‌ها",
++      skills: "مهارت‌ها",
++      files: "فایل‌ها",
++      mcp: "MCP",
++      channels: "کانال‌ها",
++      webhooks: "وب‌هوک‌ها",
++      pairing: "جفت‌سازی",
++      system: "سیستم",
++    },
++    modelToolsSheetTitle: "مدل",
++    modelToolsSheetSubtitle: "و ابزارها",
++    chatComposer: {
++      attach: "افزودن فایل",
++      uploading: "در حال آپلود…",
++      uploadFailed: "آپلود ناموفق بود",
++      remove: "حذف",
++      hint: "فایل‌ها را انتخاب کن، بعد پرامپت را در ترمینال بنویس و Enter بزن.",
++      notConnected: "چت متصل نیست.",
++      tooLarge: "فایل خیلی بزرگ است (حداکثر {mb} مگابایت).",
++      attached: "اتچ شد",
++    },
++    navigation: "ناوبری",
++    openDocumentation: "بازکردن مستندات در تب جدید",
++    openNavigation: "بازکردن ناوبری",
++    pluginNavSection: "پلاگین‌ها",
++    sessionsActiveCount: "{count} فعال",
++    statusOverview: "نمای وضعیت",
++    system: "سیستم",
++    webUi: "رابط وب",
++    managingProfile: "مدیریت پروفایل",
++  },
++
++  status: {
++    actionFailed: "عملیات ناموفق",
++    actionFinished: "پایان یافت",
++    actions: "عملیات",
++    agent: "ایجنت",
++    activeSessions: "نشست‌های فعال",
++    connected: "متصل",
++    connectedPlatforms: "پلتفرم‌های متصل",
++    disabled: "غیرفعال",
++    disconnected: "قطع‌شده",
++    error: "خطا",
++    failed: "ناموفق",
++    gateway: "گیتوی",
++    gatewayFailedToStart: "گیتوی شروع نشد",
++    lastUpdate: "آخرین به‌روزرسانی",
++    noneRunning: "هیچ",
++    notRunning: "در حال اجرا نیست",
++    pid: "PID",
++    platformDisconnected: "قطع‌شده",
++    platformError: "خطا",
++    recentSessions: "نشست‌های اخیر",
++    restartGateway: "راه‌اندازی دوباره گیتوی",
++    restartGatewayConfirmMessage:
++      "این کار فرایند گیتوی Hermes را دوباره راه‌اندازی می‌کند. کانال‌ها و نشست‌های فعال بعداً دوباره متصل می‌شوند.",
++    restartGatewayConfirmTitle: "گیتوی دوباره راه‌اندازی شود؟",
++    restartingGateway: "در حال راه‌اندازی دوباره گیتوی…",
++    running: "در حال اجرا",
++    runningRemote: "در حال اجرا (راه دور)",
++    startFailed: "شروع ناموفق",
++    starting: "در حال شروع",
++    startedInBackground: "در پس‌زمینه شروع شد — پیشرفت را در گزارش‌ها ببینید",
++    stopped: "متوقف",
++    updateHermes: "به‌روزرسانی Hermes",
++    updateHermesConfirmMessage:
++      "این کار hermes update را اجرا می‌کند و پس از پایان، گیتوی را دوباره راه‌اندازی می‌کند. نشست‌های فعال تا آن زمان کش پرامپت خود را نگه می‌دارند.",
++    updateHermesConfirmNow: "همین حالا به‌روزرسانی کن",
++    updateHermesConfirmTitle: "Hermes به‌روزرسانی شود؟",
++    updatingHermes: "در حال به‌روزرسانی Hermes…",
++    waitingForOutput: "در انتظار خروجی…",
++  },
++
++  sessions: {
++    title: "نشست‌ها",
++    history: "تاریخچه",
++    overview: "نمای کلی",
++    filterChats: "گفتگوها",
++    filterAutomation: "خودکارسازی",
++    filterAll: "همه",
++    sourceFilter: "منبع نشست",
++    anySource: "هر منبعی",
++    searchPlaceholder: "جستجو در متن پیام‌ها…",
++    noSessions: "هنوز نشستی نیست",
++    noSessionsInFilter: "در این فیلتر نشستی نیست",
++    noMatch: "هیچ نشستی با جستجوی شما مطابقت ندارد",
++    startConversation: "برای دیدن نشست، یک گفتگو شروع کنید",
++    noMessages: "بدون پیام",
++    untitledSession: "نشست بدون عنوان",
++    deleteSession: "حذف نشست",
++    confirmDeleteTitle: "نشست حذف شود؟",
++    confirmDeleteMessage: "این کار گفتگو و همه پیام‌های آن را برای همیشه حذف می‌کند. قابل بازگشت نیست.",
++    sessionDeleted: "نشست حذف شد",
++    failedToDelete: "حذف نشست ناموفق بود",
++    deleteEmpty: "حذف خالی‌ها",
++    selectSession: "انتخاب نشست",
++    selectedCount: "{count} انتخاب‌شده",
++    resumeInChat: "ادامه در گفتگو",
++    newChat: "گفتگوی جدید",
++    workspace: "فضای کاری",
++    workspaceDefault: "پیش‌فرض",
++    workspaceCustom: "مسیر دیگر…",
++    previousPage: "صفحه قبل",
++    nextPage: "صفحه بعد",
++    roles: {
++      user: "کاربر",
++      assistant: "دستیار",
++      system: "سیستم",
++      tool: "ابزار",
++    },
++  },
++
++  analytics: {
++    period: "بازه:",
++    totalTokens: "کل توکن‌ها",
++    totalSessions: "کل نشست‌ها",
++    apiCalls: "فراخوانی‌های API",
++    dailyTokenUsage: "مصرف روزانه توکن",
++    dailyBreakdown: "تفکیک روزانه",
++    perModelBreakdown: "تفکیک بر اساس مدل",
++    topSkills: "مهارت‌های برتر",
++    skill: "مهارت",
++    loads: "بارگذاری ایجنت",
++    edits: "مدیریت ایجنت",
++    lastUsed: "آخرین استفاده",
++    input: "ورودی",
++    output: "خروجی",
++    total: "کل",
++    noUsageData: "داده مصرفی برای این بازه نیست",
++    startSession: "برای دیدن تحلیل، یک نشست شروع کنید",
++    date: "تاریخ",
++    model: "مدل",
++    tokens: "توکن",
++    perDayAvg: "میانگین روزانه",
++    acrossModels: "در {count} مدل",
++    inOut: "{input} ورودی / {output} خروجی",
++  },
++
++  models: {
++    modelsUsed: "مدل‌های استفاده‌شده",
++    estimatedCost: "هزینه تخمینی",
++    tokens: "توکن",
++    sessions: "نشست",
++    avgPerSession: "میانگین هر نشست",
++    apiCalls: "فراخوانی API",
++    toolCalls: "فراخوانی ابزار",
++    noModelsData: "داده مدلی برای این بازه نیست",
++    startSession: "برای دیدن داده مدل، یک نشست شروع کنید",
++  },
++
++  logs: {
++    title: "گزارش‌ها",
++    autoRefresh: "تازه‌سازی خودکار",
++    file: "فایل",
++    level: "سطح",
++    component: "کامپوننت",
++    lines: "خطوط",
++    noLogLines: "خطی در گزارش پیدا نشد",
++  },
++
++  cron: {
++    newJob: "جاب زمان‌بندی‌شده جدید",
++    nameOptional: "نام (اختیاری)",
++    namePlaceholder: "مثلاً خلاصه روزانه",
++    prompt: "پرامپت",
++    promptPlaceholder: "ایجنت در هر اجرا چه کاری انجام دهد؟",
++    schedule: "زمان‌بندی (عبارت cron)",
++    schedulePlaceholder: "0 9 * * *",
++    scheduleMode: "زمان‌بندی",
++    deliverTo: "ارسال به",
++    scheduledJobs: "جاب‌های زمان‌بندی‌شده",
++    noJobs: "هیچ جاب cron پیکربندی نشده است. یکی در بالا بسازید.",
++    last: "آخرین",
++    next: "بعدی",
++    pause: "توقف",
++    resume: "ادامه",
++    triggerNow: "اجرای فوری",
++    scheduleModes: {
++      interval: "هر بازه",
++      daily: "روزانه",
++      weekly: "هفتگی",
++      monthly: "ماهانه",
++      once: "یک‌بار",
++      custom: "سفارشی (عبارت cron)",
++      intervalEvery: "هر",
++      intervalUnit: "واحد",
++      unitMinutes: "دقیقه",
++      unitHours: "ساعت",
++      unitDays: "روز",
++      timeOfDay: "ساعت روز",
++      weekdays: "روزهای هفته",
++      dayOfMonth: "روز ماه",
++      onceAt: "اجرا در",
++      customLabel: "عبارت cron",
++      preview: "ارسال به‌صورت",
++      previewEmpty: "(ناقص)",
++    },
++    delivery: {
++      local: "محلی",
++      telegram: "تلگرام",
++      discord: "دیسکورد",
++      slack: "اسلک",
++      email: "ایمیل",
++      needsHomeChannel: "ابتدا یک کانال خانه تنظیم کنید",
++      noneConfigured: "هیچ پلتفرم پیام‌رسانی پیکربندی نشده است. برای دریافت گزارش‌ها یکی را در کانال‌ها تنظیم کنید.",
++    },
++  },
++
++  profiles: {
++    newProfile: "پروفایل جدید",
++    name: "نام",
++    namePlaceholder: "مثلاً coder، writer و…",
++    nameRequired: "نام الزامی است",
++    invalidName: "نام پروفایل نامعتبر است",
++    cloneFrom: "کلون پیکربندی از",
++    cloneFromNone: "هیچ (خالی)",
++    allProfiles: "پروفایل‌ها",
++    noProfiles: "پروفایلی پیدا نشد.",
++    defaultBadge: "پیش‌فرض",
++    model: "مدل",
++    skills: "مهارت‌ها",
++    rename: "تغییر نام",
++    editSoul: "ویرایش SOUL.md",
++    soulSection: "SOUL.md (شخصیت / پرامپت سیستم)",
++    saveSoul: "ذخیره SOUL",
++    soulSaved: "SOUL.md ذخیره شد",
++    openInTerminal: "کپی فرمان CLI",
++    commandCopied: "در کلیپ‌بورد کپی شد",
++    copyFailed: "کپی ممکن نشد",
++    confirmDeleteTitle: "پروفایل حذف شود؟",
++    confirmDeleteMessage: "این کار پروفایل «{name}» را برای همیشه حذف می‌کند — پیکربندی، کلیدها، حافظه‌ها، نشست‌ها، مهارت‌ها و جاب‌های cron. قابل بازگشت نیست.",
++    created: "ایجاد شد",
++    deleted: "حذف شد",
++    renamed: "تغییر نام یافت",
++    activeProfile: "پروفایل فعال",
++    activeBadge: "فعال",
++    setActive: "تنظیم به‌عنوان فعال",
++    activeSet: "پروفایل فعال تنظیم شد",
++    gatewayRunning: "گیتوی در حال اجرا",
++    gatewayStopped: "گیتوی متوقف",
++    gatewayRunningWarning: "گیتوی این پروفایل در حال اجراست — متوقف خواهد شد.",
++    aliasBadge: "نام مستعار",
++    description: "توضیحات",
++    noDescription: "بدون توضیحات",
++    editDescription: "ویرایش توضیحات",
++    descriptionSaved: "توضیحات ذخیره شد",
++    reviewBadge: "بازبینی",
++    autoGenerate: "تولید خودکار",
++    generating: "در حال تولید…",
++    describeFailed: "تولید توضیحات ممکن نشد",
++    distribution: "توزیع",
++    advancedOptions: "گزینه‌های پیشرفته",
++    actions: "عملیات",
++  },
++
++  pluginsPage: {
++    contextEngineLabel: "موتور زمینه",
++    dashboardSlots: "اسلات‌های داشبورد",
++    disableRuntime: "غیرفعال",
++    enableAfterInstall: "فعال‌سازی پس از نصب",
++    enableRuntime: "فعال",
++    headline: "کشف، نصب، فعال‌سازی و به‌روزرسانی پلاگین‌های Hermes.",
++    identifierLabel: "آدرس Git یا owner/repo",
++    inactive: "غیرفعال",
++    installBtn: "نصب",
++    installHeading: "نصب از GitHub / Git",
++    installHint: "از owner/repo یا آدرس کامل https:// یا git@ استفاده کنید. برای پلاگین در زیرپوشه، مسیر را اضافه کنید: owner/repo/path/to/plugin",
++    memoryProviderLabel: "ارائه‌دهنده حافظه",
++    noDashboardTab: "بدون تب داشبورد",
++    openTab: "بازکردن",
++    pluginListHeading: "پلاگین‌های نصب‌شده",
++    providerDefaults: "داخلی / پیش‌فرض",
++    providersHeading: "پلاگین‌های ارائه‌دهنده زمان اجرا",
++    refreshDashboard: "بازخوانی افزونه‌های داشبورد",
++    removeConfirm: "این پلاگین از ~/.hermes/plugins/ حذف شود؟",
++    rescanHeading: "رجیستری پلاگین SPA",
++    rescanHint: "پس از افزودن فایل روی دیسک دوباره بازخوانی کنید تا نوار کناری داشبورد مانیفست‌های جدید را ببیند.",
++    runtimeHeading: "زمان اجرا گیتوی (پلاگین‌های YAML)",
++    saveProviders: "ذخیره تنظیمات ارائه‌دهنده",
++    savedProviders: "تنظیمات ارائه‌دهنده ذخیره شد.",
++    sourceBadge: "منبع",
++    authRequired: "نیاز به احراز هویت",
++    authRequiredHint: "برای احراز هویت این فرمان را اجرا کنید:",
++    updateGit: "Git pull",
++    updateAll: "به‌روزرسانی همه",
++    updatingAll: "در حال به‌روزرسانی پلاگین‌ها…",
++    versionBadge: "نسخه",
++    showInSidebar: "نمایش در نوار کناری",
++    hideFromSidebar: "پنهان از نوار کناری",
++    catalogHeading: "کاتالوگ پلاگین",
++    catalogSearchPlaceholder: "جستجو در کاتالوگ…",
++    catalogEmpty: "هیچ ورودی کاتالوگی مطابقت ندارد.",
++    catalogEmptyDocsLink: "درباره پلاگین‌های Hermes بدانید",
++    catalogInstallBtn: "نصب",
++    catalogInstalledBadge: "نصب‌شده ✓",
++    catalogUpdateBtn: "به‌روزرسانی موجود",
++    catalogRemovedBadge: "حذف‌شده",
++    catalogConfirmTitle: "این پلاگین نصب شود؟",
++    catalogConfirmInstallNote: "پلاگین‌ها غیرفعال نصب می‌شوند؛ برای فعال‌سازی بعد از نصب آن را فعال کنید.",
++    catalogRequiresEnv: "نیازمند env",
++    removedFromCatalog: "از کاتالوگ حذف شد",
++  },
++
++  skills: {
++    title: "مهارت‌ها",
++    searchPlaceholder: "جستجو در مهارت‌ها و ابزارها…",
++    loadWhat: "مهارت‌ها",
++    browseHub: "مرور مرکز مهارت‌ها",
++    createSkill: "ساخت مهارت",
++    enabledOf: "{enabled}/{total} فعال",
++    all: "همه",
++    categories: "دسته‌ها",
++    filters: "فیلترها",
++    noSkills: "هنوز مهارتی نصب نشده است. مرکز مهارت‌ها را ببینید یا یکی بسازید؛ در ترمینال هم می‌توانید `hermes skills search <topic>` را اجرا کنید.",
++    noSkillsMatch: "هیچ مهارتی با جستجو یا فیلتر شما مطابقت ندارد.",
++    skillCount: "{count} مهارت",
++    resultCount: "{count} نتیجه",
++    noDescription: "توضیحی موجود نیست.",
++    toolsets: "ابزارها",
++    noToolsetsMatch: "هیچ ابزاری با جستجو مطابقت ندارد.",
++    setupNeeded: "نیاز به تنظیم",
++    disabledForCli: "غیرفعال برای CLI",
++    more: "+{count} مورد دیگر",
++    profileSelector: "پروفایل",
++    currentProfile: "فعلی ({name})",
++  },
++
++  config: {
++    filters: "فیلترها",
++    sections: "بخش‌ها",
++    exportConfig: "خروجی پیکربندی به JSON",
++    importConfig: "ورود پیکربندی از JSON",
++    resetDefaults: "بازگردانی به پیش‌فرض",
++    rawYaml: "پیکربندی YAML خام",
++    searchResults: "نتایج جستجو",
++    fields: "فیلد",
++    noFieldsMatch: "هیچ فیلدی با «{query}» مطابقت ندارد",
++    configSaved: "پیکربندی ذخیره شد",
++    yamlConfigSaved: "پیکربندی YAML ذخیره شد",
++    failedToSave: "ذخیره ناموفق بود",
++    failedToSaveYaml: "ذخیره YAML ناموفق بود",
++    failedToLoadRaw: "بارگذاری پیکربندی خام ناموفق بود",
++    configImported: "پیکربندی وارد شد — بررسی و ذخیره کنید",
++    invalidJson: "فایل JSON نامعتبر است",
++    categories: {
++      general: "عمومی",
++      agent: "ایجنت",
++      terminal: "ترمینال",
++      display: "نمایش",
++      delegation: "واگذاری",
++      memory: "حافظه",
++      compression: "فشرده‌سازی",
++      security: "امنیت",
++      browser: "مرورگر",
++      voice: "صدا",
++      tts: "تبدیل متن به گفتار",
++      stt: "تبدیل گفتار به متن",
++      logging: "گزارش‌گیری",
++      auxiliary: "کمکی",
++    },
++  },
++
++  language: {
++    switchTo: "تغییر زبان",
++  },
++
++  theme: {
++    title: "تم",
++    switchTheme: "تغییر تم",
++    fontTitle: "فونت",
++    fontDefault: "پیش‌فرض تم",
++    fontDefaultHint: "استفاده از فونت تم فعال",
++    fontSans: "بدون دندانه",
++    fontSerif: "دندانه‌دار",
++    fontMono: "تک‌عرض",
++  },
++});
+diff --git a/web/src/i18n/types.ts b/web/src/i18n/types.ts
+index 9ee3e901de..19108d37fa 100644
+--- a/web/src/i18n/types.ts
++++ b/web/src/i18n/types.ts
+@@ -5,6 +5,7 @@ export type Locale =
+   | "ja"
+   | "de"
+   | "es"
++  | "fa"
+   | "fr"
+   | "tr"
+   | "uk"
+@@ -105,9 +106,25 @@ export interface Translations {
+       plugins: string;
+       sessions: string;
+       skills: string;
++      files?: string;
++      mcp?: string;
++      channels?: string;
++      webhooks?: string;
++      pairing?: string;
++      system?: string;
+     };
+     modelToolsSheetSubtitle: string;
+     modelToolsSheetTitle: string;
++    chatComposer?: {
++      attach: string;
++      uploading: string;
++      uploadFailed: string;
++      remove: string;
++      hint: string;
++      notConnected: string;
++      tooLarge: string;
++      attached: string;
++    };
+     navigation: string;
+     openDocumentation: string;
+     openNavigation: string;
+diff --git a/web/src/lib/chat-attachments.test.ts b/web/src/lib/chat-attachments.test.ts
+new file mode 100644
+index 0000000000..832f16d7ca
+--- /dev/null
++++ b/web/src/lib/chat-attachments.test.ts
+@@ -0,0 +1,37 @@
++import { describe, expect, it } from "vitest";
++
++import { buildFileMarkers, type ChatAttachment } from "./chat-attachments";
++
++function attachment(
++  overrides: Partial<ChatAttachment> & Pick<ChatAttachment, "kind" | "name" | "path">,
++): ChatAttachment {
++  return {
++    id: overrides.id ?? overrides.name,
++    size: overrides.size ?? 10,
++    ...overrides,
++  };
++}
++
++describe("buildFileMarkers", () => {
++  it("returns an empty string when nothing is attached", () => {
++    expect(buildFileMarkers([])).toBe("");
++  });
++
++  it("emits one TUI marker per file", () => {
++    const files = [
++      attachment({ kind: "file", name: "a.txt", path: "C:/uploads/a.txt" }),
++      attachment({ kind: "file", name: "b.pdf", path: "C:/uploads/b.pdf" }),
++    ];
++    expect(buildFileMarkers(files)).toBe(
++      "[User attached file: C:/uploads/a.txt]\n" +
++        "[User attached file: C:/uploads/b.pdf]",
++    );
++  });
++
++  it("does not emit markers for images", () => {
++    const images = [
++      attachment({ kind: "image", name: "one.png", path: "C:/images/one.png" }),
++    ];
++    expect(buildFileMarkers(images)).toBe("");
++  });
++});
+diff --git a/web/src/lib/chat-attachments.ts b/web/src/lib/chat-attachments.ts
+new file mode 100644
+index 0000000000..62a5c84ab6
+--- /dev/null
++++ b/web/src/lib/chat-attachments.ts
+@@ -0,0 +1,25 @@
++/** Pure helpers for the chat attachment bar. */
++
++export type ChatAttachmentKind = "image" | "file";
++
++export interface ChatAttachment {
++  id: string;
++  name: string;
++  path: string;
++  kind: ChatAttachmentKind;
++  size: number;
++}
++
++/**
++ * Build the text injected into the TUI composer when the user presses Enter.
++ *
++ * Images are attached with the TUI's ``/image`` command as soon as they finish
++ * uploading, so they never enter this text. Files use the same
++ * ``[User attached file: …]`` marker the TUI emits for a dropped file.
++ */
++export function buildFileMarkers(attachments: ChatAttachment[]): string {
++  return attachments
++    .filter((attachment) => attachment.kind === "file" && attachment.path)
++    .map((attachment) => `[User attached file: ${attachment.path}]`)
++    .join("\n");
++}
+diff --git a/web/src/lib/chat-file-upload.ts b/web/src/lib/chat-file-upload.ts
+new file mode 100644
+index 0000000000..806814ff57
+--- /dev/null
++++ b/web/src/lib/chat-file-upload.ts
+@@ -0,0 +1,55 @@
++/**
++ * Upload a browser-picked chat file to the gateway.
++ *
++ * The dashboard Chat tab is an xterm mirror of a TUI running inside the
++ * gateway, so the browser must stage the bytes first. The returned path is
++ * under the active profile's ``uploads/`` directory and is visible to the
++ * agent's file tools.
++ */
++import { authedFetch } from "@/lib/api";
++
++export interface StagedChatFileUpload {
++  install_id: string;
++  path: string;
++  profile_home: string;
++}
++
++export interface ChatFileUploadResult {
++  ok: boolean;
++  path: string;
++  size: number;
++  staged_upload?: StagedChatFileUpload;
++}
++
++export async function uploadChatFile(
++  file: File,
++  profile = "",
++): Promise<ChatFileUploadResult> {
++  if (!file.size) throw new Error("file is empty");
++
++  const form = new FormData();
++  form.append("file", file, file.name || "attachment");
++  const qs = profile ? `?profile=${encodeURIComponent(profile)}` : "";
++  const res = await authedFetch(`/api/chat/dashboard-file-upload${qs}`, {
++    method: "POST",
++    body: form,
++  });
++
++  if (!res.ok) {
++    const text = await res.text().catch(() => res.statusText);
++    let detail = text;
++    try {
++      const parsed = JSON.parse(text) as { detail?: unknown };
++      if (typeof parsed.detail === "string" && parsed.detail) detail = parsed.detail;
++    } catch {
++      /* plain-text error body */
++    }
++    throw new Error(detail || `HTTP ${res.status}`);
++  }
++
++  const uploaded = (await res.json()) as ChatFileUploadResult;
++  if (!uploaded?.path) {
++    throw new Error("file upload did not return a path");
++  }
++  return uploaded;
++}
+diff --git a/web/src/lib/resolve-page-title.ts b/web/src/lib/resolve-page-title.ts
+index 15fa5b3824..62fe151f95 100644
+--- a/web/src/lib/resolve-page-title.ts
++++ b/web/src/lib/resolve-page-title.ts
+@@ -9,6 +9,12 @@ const BUILTIN: Record<string, keyof Translations["app"]["nav"]> = {
+   "/cron": "cron",
+   "/skills": "skills",
+   "/plugins": "plugins",
++  "/files": "files",
++  "/mcp": "mcp",
++  "/channels": "channels",
++  "/webhooks": "webhooks",
++  "/pairing": "pairing",
++  "/system": "system",
+   "/profiles": "profiles",
+   "/config": "config",
+   "/env": "keys",
+@@ -42,7 +48,7 @@ export function resolvePageTitle(
+   }
+   const key = BUILTIN[normalized];
+   if (key) {
+-    return t.app.nav[key];
++    return t.app.nav[key] ?? BUILTIN_LITERAL[normalized] ?? String(key);
+   }
+   const literal = BUILTIN_LITERAL[normalized];
+   if (literal) {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index e488ea125b..8ef900b011 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -32,6 +32,7 @@ import { useNavigate, useSearchParams } from "react-router";
+ 
+ import { ChatSidebar } from "@/components/ChatSidebar";
+ import { ChatSessionList } from "@/components/ChatSessionList";
++import { ChatAttachmentBar } from "@/components/ChatAttachmentBar";
+ import { usePageHeader } from "@/contexts/usePageHeader";
+ import { useI18n } from "@/i18n";
+ import { api } from "@/lib/api";
+@@ -80,6 +81,7 @@ import {
+ import { installTerminalTouchScroll } from "@/lib/terminal-touch-scroll";
+ import { uploadChatImage } from "@/lib/chatImagePaste";
+ import { attachChatImageDropListeners } from "@/lib/chat-image-drop";
++import { buildFileMarkers, type ChatAttachment } from "@/lib/chat-attachments";
+ import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
+ import {
+   PTY_GAVE_UP_BANNER,
+@@ -130,6 +132,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+   const termRef = useRef<Terminal | null>(null);
+   const fitRef = useRef<FitAddon | null>(null);
+   const wsRef = useRef<WebSocket | null>(null);
++  const pendingFilesRef = useRef<ChatAttachment[]>([]);
++  const enterInjectionRef = useRef(false);
++  const [attachmentResetKey, setAttachmentResetKey] = useState(0);
++  const attachImagesRef = useRef<(paths: string[]) => Promise<boolean>>(
++    async () => false,
++  );
+   const isActiveRef = useRef(isActive);
+   useEffect(() => {
+     isActiveRef.current = isActive;
+@@ -365,6 +373,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+     [titleScope],
+   );
+ 
++  const handleFilesChange = useCallback((files: ChatAttachment[]) => {
++    pendingFilesRef.current = files;
++  }, []);
++
++  const handleImagesReady = useCallback(
++    async (images: { path: string; name: string }[]) => {
++      const attached = await attachImagesRef.current(
++        images.map((image) => image.path),
++      );
++      if (!attached) throw new Error("Chat is not connected");
++    },
++    [],
++  );
++
++  useEffect(() => {
++    pendingFilesRef.current = [];
++  }, [scopedProfile]);
++
+   useLayoutEffect(() => {
+     if (!isActive) {
+       setTitle(null);
+@@ -614,25 +640,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+       console.warn("[dashboard chat] image upload failed:", message);
+       setBanner(`Image upload failed: ${message}`);
+     };
+-    const driveImageAttach = async (paths: string[]) => {
++    const driveImageAttach = async (paths: string[]): Promise<boolean> => {
+       for (const path of paths) {
+-        if (imageUploadDisposed) return;
++        if (imageUploadDisposed) return false;
+         const ws = wsRef.current;
+         if (!ws || ws.readyState !== WebSocket.OPEN) {
+           setBanner(
+             "Image uploaded, but chat is not connected — try again.",
+           );
+-          return;
++          return false;
+         }
+         ws.send(`/image ${path}`);
+         await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+         const s = wsRef.current;
+-        if (!s || s.readyState !== WebSocket.OPEN) return;
++        if (!s || s.readyState !== WebSocket.OPEN) return false;
+         s.send("\r");
+         await pasteDelay();
+       }
+       term.focus();
++      return true;
+     };
++    attachImagesRef.current = driveImageAttach;
+     const uploadAndAttachImages = (files: File[]) => {
+       if (!files.length) return;
+       void (async () => {
+@@ -1509,6 +1537,41 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+         if (normalized.normalized) {
+           mobileReplacementInputUntilRef.current = 0;
+         }
++        if (
++          (normalized.data === "\r" || normalized.data === "\n") &&
++          pendingFilesRef.current.length > 0
++        ) {
++          const files = pendingFilesRef.current;
++          pendingFilesRef.current = [];
++          enterInjectionRef.current = true;
++          setAttachmentResetKey((key) => key + 1);
++          void (async () => {
++            try {
++              const markers = buildFileMarkers(files);
++              if (markers) term.paste(`\n${markers}`);
++              // The TUI treats Enter within 50 ms of a paste as pasted
++              // newline; wait past that window before submitting.
++              await new Promise<void>((resolve) =>
++                window.setTimeout(resolve, 150),
++              );
++              if (ws.readyState === WebSocket.OPEN) {
++                ws.send("\r");
++              } else {
++                setBanner("Chat is not connected — try again.");
++              }
++            } finally {
++              enterInjectionRef.current = false;
++              term.focus();
++            }
++          })();
++          return;
++        }
++        if (
++          enterInjectionRef.current &&
++          (normalized.data === "\r" || normalized.data === "\n")
++        ) {
++          return;
++        }
+         ws.send(normalized.data);
+       };
+       // The deferred composition fallback is already committed text, so it
+@@ -1546,6 +1609,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+     return () => {
+       unmounting = true;
+       imageUploadDisposed = true;
++      attachImagesRef.current = async () => false;
+       syncMetricsRef.current = null;
+       clearEraseSuppressionTimer();
+       clearResumeLoadingTimers();
+@@ -2060,6 +2124,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+           </div>
+         )}
+       </div>
++      <ChatAttachmentBar
++        key={scopedProfile}
++        resetKey={attachmentResetKey}
++        profile={scopedProfile}
++        connected={ptyState === "open"}
++        onFilesChange={handleFilesChange}
++        onImagesReady={handleImagesReady}
++      />
+       <PluginSlot name="chat:bottom" />
+     </div>
+   );
+diff --git a/web/src/themes/presets.ts b/web/src/themes/presets.ts
+index 0a0f92e277..2e419dcc70 100644
+--- a/web/src/themes/presets.ts
++++ b/web/src/themes/presets.ts
+@@ -213,8 +213,8 @@ export const nousBlueTheme: DashboardTheme = {
+   },
+   typography: DEFAULT_TYPOGRAPHY,
+   layout: DEFAULT_LAYOUT,
+-  terminalBackground: "#f5f8fc",
+-  terminalForeground: "#170d02",
++  terminalBackground: "#0B1220",
++  terminalForeground: "#E6EDF7",
+   seriesColors: {
+     inputTokenAccent: "#001934",
+     outputTokenAccent: "#0053fd",
