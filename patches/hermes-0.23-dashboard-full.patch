@@ -2241,10 +2241,10 @@ index 0000000000..56c124efe9
 +}
 diff --git a/web/src/components/SessionTranscript.tsx b/web/src/components/SessionTranscript.tsx
 new file mode 100644
-index 0000000000..fb6a7bd440
+index 0000000000..e1977a6293
 --- /dev/null
 +++ b/web/src/components/SessionTranscript.tsx
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,232 @@
 +import { ArrowDown, MessageSquare, Terminal as TerminalIcon, Wrench } from "lucide-react";
 +import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 +
@@ -2460,13 +2460,7 @@ index 0000000000..fb6a7bd440
 +            : "rounded-e-lg rounded-es-lg bg-secondary/40",
 +        )}
 +      >
-+        {message.content ? (
-+          <Markdown content={message.content} />
-+        ) : (
-+          <span className="text-xs text-text-tertiary">
-+            {t.common?.none ?? "—"}
-+          </span>
-+        )}
++        {message.content ? <Markdown content={message.content} /> : null}
 +        {hasToolCalls && (
 +          <div className="mt-2 flex flex-wrap gap-1">
 +            {message.tool_calls!.map((call) => (
@@ -3868,7 +3862,7 @@ index c9fb44d4a7..fc87cbb103 100644
  
  /** Relative time from an ISO-8601 timestamp string. */
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index e488ea125b..f50dce0d7a 100644
+index e488ea125b..02d64ae840 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
 @@ -25,19 +25,32 @@ import "@xterm/xterm/css/xterm.css";
@@ -4268,7 +4262,26 @@ index e488ea125b..f50dce0d7a 100644
            {showReconnectOverlay && (
              <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
                <div className="flex max-w-[min(28rem,calc(100vw-3rem))] flex-col items-start gap-2 border border-warning/60 bg-black/80 px-3 py-2 text-xs text-warning shadow-lg">
-@@ -2018,12 +2277,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -1984,11 +2243,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+             </div>
+           )}
+ 
+-          <CopyLastButton
+-            onClick={handleCopyLast}
+-            copied={copyState === "copied"}
+-            color={terminalFg}
+-          />
++          {chatView === "terminal" && (
++            <CopyLastButton
++              onClick={handleCopyLast}
++              copied={copyState === "copied"}
++              color={terminalFg}
++            />
++          )}
+ 
+           {chatPanelCollapsed && (
+             <Button
+@@ -2018,12 +2279,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
          </div>
  
          {!narrow && !chatPanelCollapsed && (
@@ -4299,7 +4312,7 @@ index e488ea125b..f50dce0d7a 100644
              <div className="flex h-8 shrink-0 items-center justify-end pr-1">
                <Button
                  ghost
-@@ -2052,14 +2323,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -2052,14 +2325,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                  activeSessionId={resumeParam}
                  isActive={isActive}
                  profile={scopedProfile}

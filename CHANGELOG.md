@@ -4,6 +4,15 @@ All notable changes to Context Dashboard are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-11-12
+
+### Fixed
+
+- Tool-call-only assistant messages render their tool chips without a literal
+  "None" text block in the Messages view and Sessions bubbles.
+- The floating "copy last response" button is hidden in the Messages view, where
+  it has nothing to copy and overlapped the transcript.
+
 ## [0.3.0] — 2026-11-12
 
 ### Added — dashboard session workspace (`patches/hermes-0.23-dashboard-full.patch`)
