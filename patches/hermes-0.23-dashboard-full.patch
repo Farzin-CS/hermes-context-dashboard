@@ -79,6 +79,159 @@ index 9f2e5e3b9b..831a07eea9 100644
  @router.post("/api/chat/image-upload")
  async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = None):
      """Persist a browser clipboard image where the embedded TUI can read it.
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index be61ae22c6..d19d0a7f38 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -529,12 +529,39 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
+     parents are orphaned, not cascade-deleted. See #95868.
+     """
+     profile = destructive_profile(profile, "DELETE /api/sessions/empty")
+-    deleted = await asyncio.to_thread(
+-        _with_db, profile,
+-        lambda db: db.delete_empty_sessions(sessions_dir=_session_files_dir(profile)), read_only=False)
++    deleted = await asyncio.to_thread(_sweep_empty_sessions, profile)
+     return {"ok": True, "deleted": deleted}
+ 
+ 
++def _sweep_empty_sessions(profile: Optional[str]) -> int:
++    """Run the empty-session sweep against the profile's store.
++
++    Offline (no runtime owner) the exclusive maintenance reservation does the
++    work. While a gateway owns the profile — the normal case for a dashboard
++    opened next to a running Hermes — that reservation is refused by design
++    ("Drain and stop the gateway, then retry"), which made this button a
++    guaranteed 409 and therefore a no-op. The sweep is one short transaction
++    and ``delete_empty_sessions`` skips sessions with live work, so it lands on
++    the same shared writable store a single-session delete uses instead.
++    """
++    sessions_dir = _session_files_dir(profile)
++    try:
++        return _with_db(
++            profile,
++            lambda db: db.delete_empty_sessions(sessions_dir=sessions_dir),
++            read_only=False)
++    except HTTPException as exc:
++        if exc.status_code != 409:
++            raise
++        _log.info("empty-session sweep: offline reservation refused for profile %r (%s); "
++                  "running against the shared store", profile, exc.detail)
++    db = _open_session_db_for_profile(profile, read_only=False)
++    try:
++        return db.delete_empty_sessions(sessions_dir=sessions_dir)
++    finally:
++        db.close()
++
++
+ @manage_router.get("/api/sessions/stats")
+ async def get_session_stats(profile: Optional[str] = None):
+     """Session-store statistics (mirrors `hermes sessions stats`)."""
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 2b13b58327..941139ac9e 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -626,7 +626,7 @@ async def _dashboard_selftest_loop() -> None:
+ # there, so this module reads them through the module too (one patch seam).
+ from hermes_cli import web_server_gateway as _gateway_mod
+ from hermes_cli.web_server_gateway import _ACTION_LOG_FILES, _terminate_desktop_managed_gateway
+-from hermes_cli.web_server_sessions import _auto_archive_ticker_loop
++from hermes_cli.web_server_sessions import _auto_archive_ticker_loop, _empty_session_sweep_loop
+ from hermes_cli.web_server_chat import PTY_REGISTRY
+ from hermes_cli.web_server_dashboard import (
+     _discover_dashboard_plugins, _mount_plugin_api_routes, mount_spa,
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 6b5183c343..560a729c20 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -31,6 +31,7 @@ async def standalone_lifespan(app: "FastAPI"):
+         _eager_reconcile_own_session_db, _warm_gateway_module,
+         _start_desktop_cron_ticker, _dashboard_selftest_loop,
+         _auto_archive_ticker_loop, _terminate_desktop_managed_gateway,
++        _empty_session_sweep_loop,
+     )
+     from hermes_cli.web_server_chat import PTY_REGISTRY
+ 
+@@ -138,6 +139,8 @@ async def standalone_lifespan(app: "FastAPI"):
+     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
+     # Live auto-archive timer, independent of list requests.
+     auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
++    # Reap empty draft chats (a PTY stores its row before the first message).
++    empty_sweep_task = asyncio.create_task(_empty_session_sweep_loop())
+ 
+     # Managed local runtime (local_runtime.enabled): bring llama-server back so a
+     # restart doesn't strand a llamacpp main model. Off-thread and best-effort;
+@@ -176,6 +179,7 @@ async def standalone_lifespan(app: "FastAPI"):
+         pty_reaper_task.cancel()
+         selftest_task.cancel()
+         auto_archive_task.cancel()
++        empty_sweep_task.cancel()
+         eager_reconcile_thread.join()
+         await PTY_REGISTRY.close_all()
+ 
+diff --git a/hermes_cli/web_server_dashboard.py b/hermes_cli/web_server_dashboard.py
+index c00210b525..463ab3c447 100644
+--- a/hermes_cli/web_server_dashboard.py
++++ b/hermes_cli/web_server_dashboard.py
+@@ -307,11 +307,17 @@ _BUILTIN_DASHBOARD_THEMES = [
+     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
+     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
+     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},
++    {"name": "nous-blue-large", "label": "Nous Blue (Large)", "description": "Nous Blue with bigger fonts and roomier spacing"},
+     {"name": "midnight",      "label": "Midnight",            "description": "Deep blue-violet with cool accents"},
++    {"name": "midnight-large", "label": "Midnight (Large)",   "description": "Midnight with bigger fonts and roomier spacing"},
+     {"name": "ember",     "label": "Ember",          "description": "Warm crimson and bronze — forge vibes"},
++    {"name": "ember-large", "label": "Ember (Large)", "description": "Ember with bigger fonts and roomier spacing"},
+     {"name": "mono",      "label": "Mono",           "description": "Clean grayscale — minimal and focused"},
++    {"name": "mono-large", "label": "Mono (Large)",  "description": "Mono with bigger fonts and roomier spacing"},
+     {"name": "cyberpunk", "label": "Cyberpunk",      "description": "Neon green on black — matrix terminal"},
++    {"name": "cyberpunk-large", "label": "Cyberpunk (Large)", "description": "Cyberpunk with bigger fonts and roomier spacing"},
+     {"name": "rose",      "label": "Rosé",           "description": "Soft pink and warm ivory — easy on the eyes"},
++    {"name": "rose-large", "label": "Rosé (Large)",  "description": "Rosé with bigger fonts and roomier spacing"},
+ ]
+ 
+ 
+diff --git a/hermes_cli/web_server_sessions.py b/hermes_cli/web_server_sessions.py
+index 650ba64704..a377f4256e 100644
+--- a/hermes_cli/web_server_sessions.py
++++ b/hermes_cli/web_server_sessions.py
+@@ -553,3 +553,37 @@ async def _auto_archive_ticker_loop(
+         except Exception as exc:
+             _log.debug("auto-archive tick skipped: %s", exc)
+         await asyncio.sleep(interval_s)
++
++
++async def _empty_session_sweep_loop(
++    interval_s: float = 900.0, initial_delay_s: float = 120.0) -> None:
++    """Silently discard never-used conversations.
++
++    A dashboard chat creates a session row as soon as its PTY starts, before a
++    single message exists. The desktop app models those as drafts and never
++    stores them; the dashboard cannot defer the store, so it reaps them on a
++    short timer instead. ``delete_empty_sessions`` is the same transaction the
++    "Delete empty" button used: it skips active (``ended_at IS NULL``) and
++    archived rows, so a live handshake, a user-kept archive, and a rewound
++    transcript whose soft-archived rows are the only copy are all safe.
++
++    Runs at 15 minutes, first pass two minutes after boot, and degrades a
++    missing/owned store to a debug line — maintenance must never take the
++    dashboard down.
++    """
++    await asyncio.sleep(initial_delay_s)
++    while True:
++        try:
++            await asyncio.to_thread(_sweep_empty_sessions_once, None)
++        except Exception as exc:
++            _log.debug("empty-session sweep skipped: %s", exc)
++        await asyncio.sleep(interval_s)
++
++
++def _sweep_empty_sessions_once(profile: Optional[str]) -> None:
++    """One empty-session pass through the router's gateway-aware helper."""
++    from hermes_cli.web_routers.sessions import _sweep_empty_sessions
++
++    deleted = _sweep_empty_sessions(profile)
++    if deleted:
++        _log.info("empty-session sweep: removed %d draft session(s)", deleted)
 diff --git a/hermes_cli/web_upload_limit.py b/hermes_cli/web_upload_limit.py
 index 0e8dcdbae4..c16cdd1289 100644
 --- a/hermes_cli/web_upload_limit.py
@@ -201,10 +354,19 @@ index 0c2a481ff3..645ac001d2 100644
 +    assert reached == []
 +    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
 diff --git a/web/src/App.tsx b/web/src/App.tsx
-index 49b23a4037..5342dc2f3c 100644
+index 49b23a4037..b1b63eb1b3 100644
 --- a/web/src/App.tsx
 +++ b/web/src/App.tsx
-@@ -192,7 +192,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
+@@ -63,6 +63,8 @@ import { Typography } from "@nous-research/ui/ui/components/typography/index";
+ import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
+ import { cn } from "@/lib/utils";
+ import { SidebarFooter } from "@/components/SidebarFooter";
++import { PaneResizer } from "@/components/PaneResizer";
++import { RTL_LOCALES } from "@hermes/shared/i18n";
+ import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip";
+ import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
+ import { useSidebarStatus } from "@/hooks/useSidebarStatus";
+@@ -192,7 +194,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
      label: "Sessions",
      icon: MessageSquare,
    },
@@ -213,7 +375,7 @@ index 49b23a4037..5342dc2f3c 100644
    {
      path: "/analytics",
      labelKey: "analytics",
-@@ -209,14 +209,14 @@ const BUILTIN_NAV_REST: NavItem[] = [
+@@ -209,14 +211,14 @@ const BUILTIN_NAV_REST: NavItem[] = [
    { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
    { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
    { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
@@ -233,12 +395,101 @@ index 49b23a4037..5342dc2f3c 100644
    {
      path: "/docs",
      labelKey: "documentation",
+@@ -370,9 +372,26 @@ function buildRoutes(
+ }
+ 
+ const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
++const SIDEBAR_WIDTH_KEY = "hermes-sidebar-width";
++const SIDEBAR_DEFAULT_WIDTH = 256;
++const SIDEBAR_MIN_WIDTH = 208;
++const SIDEBAR_MAX_WIDTH = 420;
++
++function readSidebarWidth(): number {
++  try {
++    const raw = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
++    if (Number.isFinite(raw) && raw >= SIDEBAR_MIN_WIDTH && raw <= SIDEBAR_MAX_WIDTH) {
++      return Math.round(raw);
++    }
++  } catch {
++    // localStorage may be unavailable in private browsing
++  }
++  return SIDEBAR_DEFAULT_WIDTH;
++}
+ 
+ export default function App() {
+-  const { t } = useI18n();
++  const { t, locale } = useI18n();
++  const isRtl = RTL_LOCALES.has(locale);
+   const { pathname } = useLocation();
+   const { profile } = useProfileScope();
+   const { manifests, loading: pluginsLoading } = usePlugins(profile);
+@@ -398,6 +417,23 @@ export default function App() {
+   }, []);
+   const isMobile = useBelowBreakpoint(1024);
+   const isDesktopCollapsed = collapsed && !isMobile;
++  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
++  const resizeSidebar = useCallback((next: number) => {
++    setSidebarWidth(next);
++    try {
++      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
++    } catch {
++      // ignore
++    }
++  }, []);
++  const resetSidebarWidth = useCallback(() => {
++    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH);
++    try {
++      localStorage.removeItem(SIDEBAR_WIDTH_KEY);
++    } catch {
++      // ignore
++    }
++  }, []);
+   const tooltipWarmRef = useRef(0);
+   const sidebarStatus = useSidebarStatus();
+   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
+@@ -593,13 +629,16 @@ export default function App() {
+               mobileOpen ? "translate-x-0" : "-translate-x-full",
+               "lg:sticky lg:top-0 lg:translate-x-0 lg:shrink-0 lg:overflow-hidden",
+               "lg:transition-[width] lg:duration-300 lg:ease-[cubic-bezier(0.23,1,0.32,1)]",
+-              collapsed && "lg:w-14",
++              collapsed ? "lg:w-14" : "lg:w-[var(--hermes-sidebar-width,16rem)]",
+             )}
+             style={{
+               background:
+                 "var(--component-sidebar-background, var(--background-base))",
+               clipPath: "var(--component-sidebar-clip-path)",
+               borderImage: "var(--component-sidebar-border-image)",
++              ...(collapsed
++                ? {}
++                : { ["--hermes-sidebar-width" as string]: `${sidebarWidth}px` }),
+             }}
+           >
+             <div
+@@ -757,6 +796,18 @@ export default function App() {
+             </div>
+           </aside>
+ 
++          <PaneResizer
++            value={sidebarWidth}
++            min={SIDEBAR_MIN_WIDTH}
++            max={SIDEBAR_MAX_WIDTH}
++            onChange={resizeSidebar}
++            onReset={resetSidebarWidth}
++            edge={isRtl ? "start" : "end"}
++            label={t.common.resizeSidebar ?? "Resize sidebar"}
++            disabled={isDesktopCollapsed}
++            className="lg:flex"
++          />
++
+           <PageHeaderProvider pluginTabs={pluginTabMeta}>
+             <div
+               className={cn(
 diff --git a/web/src/components/ChatAttachmentBar.tsx b/web/src/components/ChatAttachmentBar.tsx
 new file mode 100644
-index 0000000000..bedad88ddf
+index 0000000000..e57b981a1b
 --- /dev/null
 +++ b/web/src/components/ChatAttachmentBar.tsx
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,294 @@
 +import { Button } from "@nous-research/ui/ui/components/button";
 +import {
 +  AlertCircle,
@@ -513,7 +764,14 @@ index 0000000000..bedad88ddf
 +          <Paperclip className="h-4 w-4" />
 +          <span>{copy.attach}</span>
 +        </Button>
-+        <span className="text-xs text-muted-foreground">
++        {/* The hint is guidance, not state: on a phone it costs two lines of
++            terminal height for nothing. Connection state always stays visible. */}
++        <span
++          className={cn(
++            "text-xs text-muted-foreground",
++            connected && "hidden sm:inline",
++          )}
++        >
 +          {connected ? copy.hint : copy.notConnected}
 +        </span>
 +      </div>
@@ -523,6 +781,1705 @@ index 0000000000..bedad88ddf
 +          {error}
 +        </div>
 +      )}
++    </div>
++  );
++}
+diff --git a/web/src/components/ChatSessionList.tsx b/web/src/components/ChatSessionList.tsx
+index b286b98bb1..9b6e07ae21 100644
+--- a/web/src/components/ChatSessionList.tsx
++++ b/web/src/components/ChatSessionList.tsx
+@@ -1,39 +1,66 @@
+ /**
+- * ChatSessionList — a ChatGPT-style conversation switcher that sits beside
+- * the embedded TUI on the dashboard Chat tab.
++ * ChatSessionList — the conversation switcher beside the chat surface.
+  *
+- * It lists the most recent sessions for the active management profile and
+- * lets the user swap between them without leaving the Chat page. Selecting
+- * a row sets `/chat?resume=<id>`; ChatPage treats the resume target as part
+- * of the PTY identity, so the change tears down the current terminal child
+- * and respawns it resuming that conversation (see ChatPage.tsx). The
+- * "New session" action clears the resume param, which spawns a fresh PTY.
++ * This is the dashboard's version of the desktop app's session rail:
++ * search, pinned rows, calendar groups (Today / Yesterday / Previous 7 days /
++ * Earlier), unread markers, and a right-click action menu (resume, open in a
++ * new tab, rename, pin, mark read/unread, copy id, export, archive, delete).
+  *
+- * Best-effort, like ChatSidebar: a failed fetch surfaces a small inline
+- * error with a retry affordance and the terminal pane keeps working.
+- *
+- * This is a navigation surface, NOT a session-management one — delete,
+- * rename, export, and bulk actions live on the Sessions page. Keeping this
+- * panel read-only (plus select / new) avoids duplicating that machinery and
+- * keeps the chat context focused on switching conversations quickly.
++ * Selecting a row sets `/chat?resume=<id>`, which ChatPage treats as part of
++ * its PTY identity. "New chat" clears the resume target and spawns a fresh
++ * PTY. Session management here is intentionally the same set of mutations the
++ * Sessions page uses, so both surfaces agree on the store's revision.
+  */
+ 
+ import { Button } from "@nous-research/ui/ui/components/button";
+-import { ListItem } from "@nous-research/ui/ui/components/list-item";
+ import { Spinner } from "@nous-research/ui/ui/components/spinner";
+-import { AlertCircle, MessageSquarePlus, RefreshCw } from "lucide-react";
++import {
++  AlertCircle,
++  Archive,
++  Check,
++  Copy,
++  Download,
++  ExternalLink,
++  Mail,
++  MailOpen,
++  MessageSquarePlus,
++  MoreHorizontal,
++  Pencil,
++  Pin,
++  PinOff,
++  RefreshCw,
++  Search,
++  Trash2,
++  X,
++} from "lucide-react";
+ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+ import { useSearchParams } from "react-router";
+ 
+ import { ChatWorkspacePicker } from "@/components/ChatWorkspacePicker";
++import {
++  SessionActionsMenu,
++  type SessionMenuAction,
++} from "@/components/SessionActionsMenu";
+ import { useI18n } from "@/i18n";
+ import { api, type SessionInfo } from "@/lib/api";
++import { errorMessage } from "@/lib/api-error";
+ import { cn, timeAgo } from "@/lib/utils";
++import { groupSessions, matchesSessionQuery } from "@/lib/session-groups";
++import type { SessionGroupKey } from "@/lib/session-groups";
+ 
+-const SESSION_LIMIT = 30;
++const SESSION_LIMIT = 60;
+ const SESSION_REFRESH_MS = 20_000;
++
++const GROUP_LABEL: Record<SessionGroupKey, (t: ReturnType<typeof useI18n>["t"]) => string> = {
++  pinned: (t) => t.sessions.pinned ?? "Pinned",
++  today: (t) => t.sessions.today ?? "Today",
++  yesterday: (t) => t.sessions.yesterday ?? "Yesterday",
++  week: (t) => t.sessions.previous7Days ?? "Previous 7 days",
++  earlier: (t) => t.sessions.earlier ?? "Earlier",
++};
++
+ interface ChatSessionListProps {
+-  /** Active resume target (the session currently shown in the terminal). */
++  /** Active resume target (the session currently shown in the chat surface). */
+   activeSessionId: string | null;
+   /** Whether the Chat route is visible and should refresh its session list. */
+   isActive?: boolean;
+@@ -42,19 +69,15 @@ interface ChatSessionListProps {
+   className?: string;
+   /** Optional callback fired after a row is picked (e.g. close mobile sheet). */
+   onPicked?: () => void;
++  /** Fired when a row is opened, so the tab strip can add it. */
++  onOpened?: (session: SessionInfo) => void;
+   /**
+    * Starts a fresh chat. ChatPage supplies its `startFreshDashboardChat`,
+    * which clears `?resume` AND bumps the reconnect nonce so a brand-new PTY
+-   * spawns even when the user is already on an unsaved fresh session. When
+-   * omitted, we fall back to clearing the resume param ourselves.
++   * spawns even when the user is already on an unsaved fresh session.
+    */
+   onNewChat?: () => void;
+-  /**
+-   * Workspace a FRESH chat starts in (absolute host path, "" = server
+-   * default). Owned by ChatPage, which sends it as `/api/pty?cwd=`; the
+-   * picker renders here beside "New chat" so the choice sits next to the
+-   * action it affects. Omit both to hide the picker.
+-   */
++  /** Workspace a FRESH chat starts in (absolute host path, "" = default). */
+   workspaceCwd?: string;
+   onWorkspaceChange?: (cwd: string) => void;
+ }
+@@ -73,27 +96,46 @@ export function ChatSessionList({
+   profile,
+   className,
+   onPicked,
++  onOpened,
+   onNewChat,
+   workspaceCwd,
+   onWorkspaceChange,
+ }: ChatSessionListProps) {
+-  const { t } = useI18n();
++  const { t, locale } = useI18n();
+   const [, setSearchParams] = useSearchParams();
+   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+-  // Bumped to force a refetch (after switching, on Refresh, on mount).
++  const [query, setQuery] = useState("");
++  const [notice, setNotice] = useState<string | null>(null);
++  const [busyId, setBusyId] = useState<string | null>(null);
++  const [menu, setMenu] = useState<{
++    session: SessionInfo;
++    x: number;
++    y: number;
++  } | null>(null);
++  const [renaming, setRenaming] = useState<{
++    id: string;
++    value: string;
++    saving: boolean;
++  } | null>(null);
+   const [reloadNonce, setReloadNonce] = useState(0);
++  const reqRef = useRef(0);
++  const noticeTimer = useRef<number | null>(null);
+ 
+-  // `profile` is read inside the fetch; it's part of the scope key so a
+-  // profile switch refetches. The empty-string fallback keeps the dep
+-  // stable when no profile is selected (default profile).
+   const scopeKey = profile ?? "";
+ 
+-  // Monotonic request token: only the most recent fetch is allowed to
+-  // commit state, so a fast profile switch (or Refresh spam) can't land a
+-  // stale list out of order.
+-  const reqRef = useRef(0);
++  const flash = useCallback((message: string) => {
++    setNotice(message);
++    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
++    noticeTimer.current = window.setTimeout(() => setNotice(null), 3200);
++  }, []);
++
++  useEffect(() => {
++    return () => {
++      if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
++    };
++  }, []);
+ 
+   const load = useCallback(() => {
+     const myReq = ++reqRef.current;
+@@ -118,12 +160,8 @@ export function ChatSessionList({
+ 
+   useEffect(() => {
+     if (!isActive) return;
+-    // Dashboard data surfaces fetch from an effect on mount + scope change;
+-    // keep this local and explicit until the shared lint profile is updated
+-    // for async loaders (matches FilesPage).
+     // eslint-disable-next-line react-hooks/set-state-in-effect
+     load();
+-    // `reloadNonce` is a manual refetch trigger (Refresh button / row pick).
+   }, [isActive, load, reloadNonce]);
+ 
+   useEffect(() => {
+@@ -139,29 +177,124 @@ export function ChatSessionList({
+     };
+   }, [isActive, reload]);
+ 
+-  // Picking a row sets `/chat?resume=<id>`. Re-picking the row already in
+-  // the terminal is a no-op (avoids a needless PTY teardown).
++  const patchSession = useCallback(
++    async (session: SessionInfo, fields: Parameters<typeof api.patchSession>[1]) => {
++      const rowProfile = session.profile ?? scopeKey;
++      setBusyId(session.id);
++      try {
++        await api.patchSession(session.id, fields, rowProfile);
++        setSessions((prev) =>
++          prev
++            ? prev
++                .map((s) => (s.id === session.id ? { ...s, ...fields } : s))
++                .filter((s) => !fields.archived || !s.archived)
++                .filter((s) => !s.archived)
++            : prev,
++        );
++        reload();
++      } catch (e) {
++        flash(errorMessage(e));
++      } finally {
++        setBusyId(null);
++      }
++    },
++    [flash, reload, scopeKey],
++  );
++
++  const saveRename = useCallback(
++    async (session: SessionInfo) => {
++      if (!renaming) return;
++      const title = renaming.value.trim();
++      if (!title || title === session.title) {
++        setRenaming(null);
++        return;
++      }
++      setRenaming({ ...renaming, saving: true });
++      try {
++        await api.renameSession(session.id, title, session.profile ?? scopeKey);
++        setSessions((prev) =>
++          prev ? prev.map((s) => (s.id === session.id ? { ...s, title } : s)) : prev,
++        );
++        setRenaming(null);
++      } catch (e) {
++        setRenaming({ ...renaming, saving: false });
++        flash(errorMessage(e));
++      }
++    },
++    [flash, renaming, scopeKey],
++  );
++
++  const deleteSession = useCallback(
++    async (session: SessionInfo) => {
++      const ok = window.confirm(
++        `${t.sessions.confirmDeleteTitle}\n\n${t.sessions.confirmDeleteMessage}`,
++      );
++      if (!ok) return;
++      setBusyId(session.id);
++      try {
++        await api.deleteSession(session.id, session.profile ?? scopeKey);
++        setSessions((prev) => (prev ? prev.filter((s) => s.id !== session.id) : prev));
++        if (activeSessionId === session.id) {
++          setSearchParams(
++            (prev) => {
++              const next = new URLSearchParams(prev);
++              next.delete("resume");
++              return next;
++            },
++            { replace: true },
++          );
++        }
++      } catch (e) {
++        flash(errorMessage(e));
++      } finally {
++        setBusyId(null);
++      }
++    },
++    [activeSessionId, flash, scopeKey, setSearchParams, t.sessions.confirmDeleteMessage, t.sessions.confirmDeleteTitle],
++  );
++
++  const copyId = useCallback(
++    async (session: SessionInfo) => {
++      try {
++        await navigator.clipboard.writeText(session.id);
++        flash(t.common.sessionIdCopied ?? t.common.copyId ?? "Session ID copied");
++      } catch {
++        flash(t.common.copyFailed ?? "Could not copy to the clipboard");
++      }
++    },
++    [flash, t.common.copyFailed, t.common.copyId, t.common.sessionIdCopied],
++  );
++
++  const openInNewTab = useCallback((session: SessionInfo) => {
++    const url = `/chat?resume=${encodeURIComponent(session.id)}`;
++    window.open(url, "_blank", "noopener,noreferrer");
++  }, []);
++
++  const exportSession = useCallback(
++    (session: SessionInfo) => {
++      const url = api.exportSessionUrl(session.id, session.profile ?? scopeKey);
++      window.open(url, "_blank", "noopener,noreferrer");
++    },
++    [scopeKey],
++  );
++
+   const pick = useCallback(
+-    (id: string) => {
++    (session: SessionInfo) => {
+       onPicked?.();
+-      if (id === activeSessionId) return;
++      onOpened?.(session);
++      if (session.id === activeSessionId) return;
+       setSearchParams(
+         (prev) => {
+           const next = new URLSearchParams(prev);
+-          next.set("resume", id);
++          next.set("resume", session.id);
+           return next;
+         },
+         { replace: false },
+       );
+     },
+-    [activeSessionId, onPicked, setSearchParams],
++    [activeSessionId, onOpened, onPicked, setSearchParams],
+   );
+ 
+-  // "New chat" prefers ChatPage's robust handler (clears resume + forces a
+-  // PTY respawn even from an already-fresh session). Fallback: clear the
+-  // resume param ourselves, which spawns a fresh PTY whenever one was being
+-  // resumed. Session management (delete/rename/export) lives on the Sessions
+-  // page; this panel only switches and starts conversations.
+   const startNew = useCallback(() => {
+     onPicked?.();
+     if (onNewChat) {
+@@ -178,6 +311,240 @@ export function ChatSessionList({
+     );
+   }, [onNewChat, onPicked, setSearchParams]);
+ 
++  const filtered = useMemo(() => {
++    const rows = sessions ?? [];
++    return rows.filter((s) => matchesSessionQuery(s, query));
++  }, [query, sessions]);
++
++  const groups = useMemo(() => groupSessions(filtered), [filtered]);
++  const matchCount = filtered.length;
++  const hasSessions = (sessions?.length ?? 0) > 0;
++
++  const actionsFor = useCallback(
++    (session: SessionInfo): SessionMenuAction[] => [
++      {
++        key: "resume",
++        label: t.sessions.resumeInChat,
++        icon: ExternalLink,
++        onSelect: () => pick(session),
++      },
++      {
++        key: "new-tab",
++        label: t.common.openInNewTab ?? "Open in new tab",
++        icon: ExternalLink,
++        onSelect: () => openInNewTab(session),
++      },
++      {
++        key: "rename",
++        label: t.common.rename ?? "Rename",
++        icon: Pencil,
++        onSelect: () =>
++          setRenaming({ id: session.id, value: rowLabel(session, ""), saving: false }),
++      },
++      {
++        key: "pin",
++        label: session.pinned
++          ? (t.common.unpin ?? "Unpin")
++          : (t.common.pin ?? "Pin"),
++        icon: session.pinned ? PinOff : Pin,
++        onSelect: () => void patchSession(session, { pinned: !session.pinned }),
++      },
++      {
++        key: "unread",
++        label: session.unread
++          ? (t.common.markRead ?? "Mark as read")
++          : (t.common.markUnread ?? "Mark as unread"),
++        icon: session.unread ? MailOpen : Mail,
++        onSelect: () => void patchSession(session, { unread: !session.unread }),
++      },
++      {
++        key: "copy-id",
++        label: t.common.copyId ?? "Copy ID",
++        icon: Copy,
++        onSelect: () => void copyId(session),
++      },
++      {
++        key: "export",
++        label: t.common.export ?? "Export",
++        icon: Download,
++        onSelect: () => exportSession(session),
++        dividerBefore: true,
++      },
++      {
++        key: "archive",
++        label: t.common.archive ?? "Archive",
++        icon: Archive,
++        onSelect: () => void patchSession(session, { archived: true }),
++      },
++      {
++        key: "delete",
++        label: t.sessions.deleteSession,
++        icon: Trash2,
++        danger: true,
++        onSelect: () => void deleteSession(session),
++      },
++    ],
++    [
++      copyId,
++      deleteSession,
++      exportSession,
++      openInNewTab,
++      patchSession,
++      pick,
++      t.common.archive,
++      t.common.copyId,
++      t.common.export,
++      t.common.markRead,
++      t.common.markUnread,
++      t.common.openInNewTab,
++      t.common.pin,
++      t.common.rename,
++      t.common.unpin,
++      t.sessions.deleteSession,
++      t.sessions.resumeInChat,
++    ],
++  );
++
++  const renderRow = (session: SessionInfo) => {
++    const active = session.id === activeSessionId;
++    const isRenaming = renaming?.id === session.id;
++    const label = rowLabel(session, t.sessions.untitledSession);
++    return (
++      <div
++        key={session.id}
++        role="button"
++        tabIndex={0}
++        aria-current={active ? "true" : undefined}
++        onClick={() => {
++          if (!isRenaming) pick(session);
++        }}
++        onKeyDown={(event) => {
++          if (event.key === "Enter" || event.key === " ") {
++            event.preventDefault();
++            pick(session);
++          }
++          if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
++            event.preventDefault();
++            const rect = event.currentTarget.getBoundingClientRect();
++            setMenu({ session, x: rect.left + 16, y: rect.top + 12 });
++          }
++        }}
++        onContextMenu={(event) => {
++          event.preventDefault();
++          setMenu({ session, x: event.clientX, y: event.clientY });
++        }}
++        className={cn(
++          "group relative flex w-full min-w-0 flex-col gap-0.5 border border-transparent",
++          "px-2 py-1.5 text-start transition-colors",
++          active
++            ? "border-primary/30 bg-primary/10"
++            : "hover:border-current/15 hover:bg-midground/5",
++        )}
++      >
++        <div className="flex min-w-0 items-center gap-1.5">
++          {session.unread && (
++            <span
++              aria-label={t.common.markUnread}
++              className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary"
++            />
++          )}
++          {session.pinned && (
++            <Pin className="h-3 w-3 shrink-0 text-primary" aria-hidden />
++          )}
++          {isRenaming ? (
++            <span className="flex min-w-0 flex-1 items-center gap-1">
++              <input
++                autoFocus
++                value={renaming.value}
++                disabled={renaming.saving}
++                onChange={(event) =>
++                  setRenaming((prev) =>
++                    prev ? { ...prev, value: event.target.value } : prev,
++                  )
++                }
++                onKeyDown={(event) => {
++                  if (event.key === "Enter") void saveRename(session);
++                  if (event.key === "Escape") setRenaming(null);
++                }}
++                onClick={(event) => event.stopPropagation()}
++                className={cn(
++                  "min-w-0 flex-1 border border-primary/40 bg-background-base px-1 py-0.5",
++                  "text-xs normal-case tracking-normal text-foreground outline-none",
++                )}
++                aria-label={t.common.rename}
++              />
++              <button
++                type="button"
++                onClick={(event) => {
++                  event.stopPropagation();
++                  void saveRename(session);
++                }}
++                className="shrink-0 p-0.5 text-success hover:text-foreground"
++                aria-label={t.common.save}
++              >
++                {renaming.saving ? <Spinner /> : <Check className="h-3.5 w-3.5" />}
++              </button>
++              <button
++                type="button"
++                onClick={(event) => {
++                  event.stopPropagation();
++                  setRenaming(null);
++                }}
++                className="shrink-0 p-0.5 text-text-tertiary hover:text-foreground"
++                aria-label={t.common.cancel}
++              >
++                <X className="h-3.5 w-3.5" />
++              </button>
++            </span>
++          ) : (
++            <span
++              className={cn(
++                "min-w-0 flex-1 truncate text-[0.8125rem]",
++                active ? "font-medium text-foreground" : "text-foreground/90",
++              )}
++              dir="auto"
++            >
++              {label}
++            </span>
++          )}
++          {busyId === session.id && <Spinner className="shrink-0" />}
++          <button
++            type="button"
++            aria-label={t.sessions.actions ?? "Session actions"}
++            title={t.common.moreActions ?? "More actions"}
++            onClick={(event) => {
++              event.stopPropagation();
++              const rect = event.currentTarget.getBoundingClientRect();
++              setMenu({ session, x: rect.left, y: rect.bottom + 4 });
++            }}
++            className={cn(
++              "shrink-0 rounded p-0.5 text-text-tertiary opacity-0 transition-opacity",
++              "hover:bg-midground/10 hover:text-foreground",
++              "group-hover:opacity-100 group-focus-within:opacity-100",
++            )}
++          >
++            <MoreHorizontal className="h-3.5 w-3.5" />
++          </button>
++        </div>
++        <div className="flex min-w-0 items-center gap-1.5 ps-0.5 text-[0.6875rem] text-text-tertiary">
++          <span className="shrink-0">{timeAgo(session.last_active, locale)}</span>
++          {session.message_count > 0 && (
++            <>
++              <span aria-hidden>·</span>
++              <span className="shrink-0">{session.message_count} msgs</span>
++            </>
++          )}
++          {session.source && session.source !== "cli" && (
++            <>
++              <span aria-hidden>·</span>
++              <span className="truncate">{session.source}</span>
++            </>
++          )}
++        </div>
++      </div>
++    );
++  };
++
+   const content = useMemo(() => {
+     if (loading && sessions === null) {
+       return (
+@@ -199,54 +566,42 @@ export function ChatSessionList({
+         </div>
+       );
+     }
+-    if (!sessions || sessions.length === 0) {
++    if (!hasSessions) {
+       return (
+         <div className="px-2 py-6 text-center text-xs text-text-secondary">
+           {t.sessions.noSessions}
+         </div>
+       );
+     }
++    if (matchCount === 0) {
++      return (
++        <div className="px-2 py-6 text-center text-xs text-text-secondary">
++          {t.sessions.noSearchResults ?? t.sessions.noMatch}
++        </div>
++      );
++    }
+     return (
+       <div className="flex flex-col gap-0.5">
+-        {sessions.map((s) => {
+-          const isActive = s.id === activeSessionId;
+-          return (
+-            <ListItem
+-              key={s.id}
+-              onClick={() => pick(s.id)}
+-              aria-current={isActive ? "true" : undefined}
++        {groups.map((group) => (
++          <section key={group.key} className="flex flex-col gap-0.5" aria-label={GROUP_LABEL[group.key](t)}>
++            <h3
+               className={cn(
+-                "flex-col items-start gap-0.5 rounded px-2 py-1.5",
+-                "normal-case tracking-normal",
+-                isActive
+-                  ? "bg-primary/10 text-foreground border-l-2 border-primary"
+-                  : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
++                "sticky top-0 z-[1] -mx-1 flex items-center gap-1.5 px-2 py-1",
++                "bg-background-base/95 text-[0.625rem] uppercase tracking-[0.12em]",
++                "text-text-tertiary backdrop-blur",
+               )}
+             >
+-              <span className="w-full truncate text-sm font-medium">
+-                {rowLabel(s, t.sessions.untitledSession)}
+-              </span>
+-              <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
+-                <span>{timeAgo(s.last_active)}</span>
+-                {s.message_count > 0 && (
+-                  <>
+-                    <span aria-hidden>·</span>
+-                    <span>{s.message_count} msgs</span>
+-                  </>
+-                )}
+-                {s.source && s.source !== "cli" && (
+-                  <>
+-                    <span aria-hidden>·</span>
+-                    <span className="truncate">{s.source}</span>
+-                  </>
+-                )}
+-              </span>
+-            </ListItem>
+-          );
+-        })}
++              {group.key === "pinned" && <Pin className="h-2.5 w-2.5" aria-hidden />}
++              {GROUP_LABEL[group.key](t)}
++              <span className="tabular-nums opacity-70">{group.sessions.length}</span>
++            </h3>
++            {group.sessions.map(renderRow)}
++          </section>
++        ))}
+       </div>
+     );
+-  }, [activeSessionId, error, loading, pick, reload, sessions, t]);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [activeSessionId, busyId, error, filtered, groups, hasSessions, loading, matchCount, query, renaming, sessions, t]);
+ 
+   return (
+     <aside
+@@ -254,6 +609,7 @@ export function ChatSessionList({
+         "flex h-full w-full min-w-0 shrink-0 flex-col overflow-hidden",
+         className,
+       )}
++      aria-label={t.sessions.title}
+     >
+       <div className="flex items-center justify-between gap-2 px-2 pb-2">
+         <span className="text-display text-xs tracking-wider text-text-tertiary">
+@@ -267,7 +623,7 @@ export function ChatSessionList({
+           title={t.common.refresh}
+           className="text-text-secondary hover:text-foreground"
+         >
+-          <RefreshCw className={cn(loading && "animate-spin")} />
++          <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
+         </Button>
+       </div>
+ 
+@@ -289,9 +645,61 @@ export function ChatSessionList({
+         {t.sessions.newChat}
+       </Button>
+ 
++      <div className="relative mx-2 mb-2">
++        {loading && sessions !== null ? (
++          <Spinner className="absolute start-2 top-1/2 -translate-y-1/2 text-[0.75rem] text-primary" />
++        ) : (
++          <Search className="absolute start-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-tertiary" />
++        )}
++        <input
++          value={query}
++          onChange={(event) => setQuery(event.target.value)}
++          placeholder={t.sessions.searchSessions ?? t.sessions.searchPlaceholder}
++          aria-label={t.sessions.searchSessions ?? t.sessions.searchPlaceholder}
++          className={cn(
++            "h-7 w-full border border-current/20 bg-background-base/60",
++            "ps-7 pe-7 text-xs text-foreground placeholder:text-text-tertiary",
++            "outline-none focus:border-primary/50",
++          )}
++        />
++        {query && (
++          <button
++            type="button"
++            onClick={() => setQuery("")}
++            aria-label={t.common.clear}
++            className="absolute end-1.5 top-1/2 -translate-y-1/2 p-0.5 text-text-tertiary hover:text-foreground"
++          >
++            <X className="h-3 w-3" />
++          </button>
++        )}
++      </div>
++
++      {notice && (
++        <div
++          role="status"
++          className="mx-2 mb-1 border border-primary/30 bg-primary/10 px-2 py-1 text-[0.6875rem] text-foreground"
++        >
++          {notice}
++        </div>
++      )}
++
+       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1 pb-1">
+         {content}
+       </div>
++
++      <p className="shrink-0 px-2 pt-1 pb-1 text-[0.625rem] leading-snug text-text-tertiary">
++        {t.common.autoCleanupHint ?? t.sessions.emptyRuns}
++      </p>
++
++      {menu && (
++        <SessionActionsMenu
++          x={menu.x}
++          y={menu.y}
++          actions={actionsFor(menu.session)}
++          onClose={() => setMenu(null)}
++          label={t.sessions.actions ?? "Session actions"}
++        />
++      )}
+     </aside>
+   );
+ }
+diff --git a/web/src/components/ChatTabs.tsx b/web/src/components/ChatTabs.tsx
+new file mode 100644
+index 0000000000..1beb4874f2
+--- /dev/null
++++ b/web/src/components/ChatTabs.tsx
+@@ -0,0 +1,104 @@
++import { Plus, X } from "lucide-react";
++
++import { cn } from "@/lib/utils";
++import type { ChatTab } from "@/lib/chat-tabs";
++import { NEW_TAB_ID } from "@/lib/chat-tabs";
++
++/**
++ * The open-conversation strip above the chat surface. Mirrors the desktop
++ * app's session tabs: the active conversation is highlighted, each tab closes
++ * with × or a middle click, and "+" starts a fresh chat.
++ *
++ * Switching tabs changes `?resume=`, which is how ChatPage already identifies
++ * a PTY, so no second terminal is kept alive — the tab is a navigation
++ * surface, not a second runtime.
++ */
++export function ChatTabs({
++  tabs,
++  activeId,
++  onSelect,
++  onClose,
++  onNew,
++  newLabel,
++  closeLabel,
++  label,
++}: {
++  tabs: ChatTab[];
++  activeId: string | null;
++  onSelect: (tab: ChatTab) => void;
++  onClose: (tab: ChatTab) => void;
++  onNew: () => void;
++  newLabel: string;
++  closeLabel: string;
++  label: string;
++}) {
++  return (
++    <div
++      className={cn(
++        "flex min-h-9 w-full min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden",
++        "border-b border-current/15 pb-1",
++      )}
++      role="tablist"
++      aria-label={label}
++    >
++      {tabs.map((tab) => {
++        const active = tab.id === activeId;
++        const isDraft = tab.id === NEW_TAB_ID;
++        return (
++          <div
++            key={tab.id}
++            className={cn(
++              "group flex max-w-56 min-w-0 shrink-0 items-center gap-1.5 border",
++              "px-2.5 py-1 text-xs transition-colors",
++              active
++                ? "border-primary/60 bg-primary/10 text-foreground"
++                : "border-transparent text-text-secondary hover:border-current/20 hover:bg-midground/5 hover:text-foreground",
++            )}
++          >
++            <button
++              type="button"
++              role="tab"
++              aria-selected={active}
++              onClick={() => onSelect(tab)}
++              onAuxClick={(event) => {
++                if (event.button === 1 && !isDraft) {
++                  event.preventDefault();
++                  onClose(tab);
++                }
++              }}
++              className="min-w-0 flex-1 truncate text-start normal-case tracking-normal"
++              title={tab.title}
++            >
++              {tab.title}
++            </button>
++            <button
++              type="button"
++              onClick={() => onClose(tab)}
++              aria-label={`${closeLabel}: ${tab.title}`}
++              title={closeLabel}
++              className={cn(
++                "shrink-0 rounded p-0.5 text-text-tertiary opacity-60 transition-opacity",
++                "hover:bg-midground/10 hover:text-foreground group-hover:opacity-100",
++              )}
++            >
++              <X className="h-3 w-3" />
++            </button>
++          </div>
++        );
++      })}
++
++      <button
++        type="button"
++        onClick={onNew}
++        aria-label={newLabel}
++        title={newLabel}
++        className={cn(
++          "flex shrink-0 items-center justify-center px-2 text-text-secondary",
++          "transition-colors hover:bg-midground/5 hover:text-foreground",
++        )}
++      >
++        <Plus className="h-4 w-4" />
++      </button>
++    </div>
++  );
++}
+diff --git a/web/src/components/Markdown.tsx b/web/src/components/Markdown.tsx
+index a78c4430c3..4ae4b8f4d8 100644
+--- a/web/src/components/Markdown.tsx
++++ b/web/src/components/Markdown.tsx
+@@ -1,5 +1,7 @@
+ import { useMemo, type ReactNode } from "react";
+ 
++import { hasRtlText } from "@/lib/text-direction";
++
+ /**
+  * Lightweight markdown renderer for LLM output.
+  * Handles: code blocks, inline code, bold, italic, headers, links, lists, horizontal rules.
+@@ -22,7 +24,7 @@ export function Markdown({
+   const caret = streaming ? <StreamingCaret /> : null;
+ 
+   return (
+-    <div className="text-sm text-foreground leading-relaxed space-y-2">
++    <div className="hermes-md text-sm text-foreground leading-relaxed space-y-2">
+       {blocks.map((block, i) => (
+         <Block
+           key={i}
+@@ -168,8 +170,11 @@ function Block({
+   switch (block.type) {
+     case "code":
+       return (
+-        <pre className="bg-secondary/60 border border-border px-3 py-2.5 text-xs font-mono leading-relaxed overflow-x-auto">
+-          <code>
++        <pre
++          dir="ltr"
++          className="hermes-md-code bg-secondary/60 border border-border px-3 py-2.5 text-xs font-mono leading-relaxed overflow-x-auto"
++        >
++          <code dir="ltr">
+             {block.content}
+             {caret}
+           </code>
+@@ -185,7 +190,10 @@ function Block({
+         h4: "text-sm font-medium",
+       };
+       return (
+-        <Tag className={sizes[Tag]}>
++        <Tag
++          dir={hasRtlText(block.content) ? "auto" : undefined}
++          className={`hermes-md-block ${sizes[Tag]}`}
++        >
+           <InlineContent text={block.content} highlightTerms={highlightTerms} />
+           {caret}
+         </Tag>
+@@ -203,9 +211,14 @@ function Block({
+     case "list": {
+       const Tag = block.ordered ? "ol" : "ul";
+       const last = block.items.length - 1;
++      // `ps-*` is logical padding, so markers sit on the correct side when
++      // the list resolves RTL. `dir="auto"` makes the markers and the box
++      // direction follow the first strong character instead of the shell.
++      const rtl = block.items.some((item) => hasRtlText(item));
+       return (
+         <Tag
+-          className={`space-y-0.5 ${block.ordered ? "list-decimal" : "list-disc"} pl-5 text-sm`}
++          dir={rtl ? "auto" : undefined}
++          className={`hermes-md-block space-y-0.5 ${block.ordered ? "list-decimal" : "list-disc"} ps-5 text-sm`}
+         >
+           {block.items.map((item, i) => (
+             <li key={i}>
+@@ -219,7 +232,10 @@ function Block({
+ 
+     case "paragraph":
+       return (
+-        <p>
++        <p
++          dir={hasRtlText(block.content) ? "auto" : undefined}
++          className="hermes-md-block"
++        >
+           <InlineContent text={block.content} highlightTerms={highlightTerms} />
+           {caret}
+         </p>
+@@ -307,6 +323,7 @@ function InlineContent({
+             return (
+               <code
+                 key={i}
++                dir="ltr"
+                 className="bg-secondary/60 px-1.5 py-0.5 text-xs font-mono text-primary/90"
+               >
+                 {node.content}
+diff --git a/web/src/components/PaneResizer.tsx b/web/src/components/PaneResizer.tsx
+new file mode 100644
+index 0000000000..05c4a29554
+--- /dev/null
++++ b/web/src/components/PaneResizer.tsx
+@@ -0,0 +1,163 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++
++import { cn } from "@/lib/utils";
++
++/**
++ * A draggable divider for a resizable pane.
++ *
++ * `edge="end"` sits on the right edge of a left-hand pane (the app sidebar):
++ * dragging right grows the pane. `edge="start"` sits on the left edge of a
++ * right-hand pane (the chat side panel): dragging left grows the pane.
++ * Both cases are expressed with physical coordinates, so the caller maps
++ * them for RTL (a mirrored sidebar passes `edge="start"`).
++ *
++ * Double-click resets. Arrow keys resize by 16px when focused, Home/End jump
++ * to the min/max, matching native splitter behaviour.
++ */
++export function PaneResizer({
++  value,
++  min,
++  max,
++  onChange,
++  onReset,
++  edge = "end",
++  label,
++  className,
++  disabled = false,
++}: {
++  value: number;
++  min: number;
++  max: number;
++  onChange: (width: number) => void;
++  onReset?: () => void;
++  edge?: "start" | "end";
++  label: string;
++  className?: string;
++  disabled?: boolean;
++}) {
++  const [dragging, setDragging] = useState(false);
++  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
++  const frameRef = useRef<number | null>(null);
++  const pendingRef = useRef<number | null>(null);
++
++  const clamp = useCallback(
++    (next: number) => Math.min(max, Math.max(min, Math.round(next))),
++    [min, max],
++  );
++
++  const commit = useCallback(
++    (next: number) => {
++      pendingRef.current = clamp(next);
++      if (frameRef.current !== null) return;
++      frameRef.current = window.requestAnimationFrame(() => {
++        frameRef.current = null;
++        if (pendingRef.current !== null) {
++          onChange(pendingRef.current);
++          pendingRef.current = null;
++        }
++      });
++    },
++    [clamp, onChange],
++  );
++
++  useEffect(() => {
++    return () => {
++      if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current);
++    };
++  }, []);
++
++  const onPointerDown = useCallback(
++    (event: React.PointerEvent<HTMLDivElement>) => {
++      if (disabled || event.button !== 0) return;
++      event.preventDefault();
++      event.stopPropagation();
++      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
++      dragRef.current = { startX: event.clientX, startWidth: value };
++      setDragging(true);
++      document.body.style.userSelect = "none";
++      document.body.style.cursor = "col-resize";
++    },
++    [disabled, value],
++  );
++
++  const onPointerMove = useCallback(
++    (event: React.PointerEvent<HTMLDivElement>) => {
++      const drag = dragRef.current;
++      if (!drag) return;
++      const delta = event.clientX - drag.startX;
++      commit(drag.startWidth + (edge === "end" ? delta : -delta));
++    },
++    [commit, edge],
++  );
++
++  const endDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
++    if (!dragRef.current) return;
++    dragRef.current = null;
++    setDragging(false);
++    document.body.style.userSelect = "";
++    document.body.style.cursor = "";
++    try {
++      (event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId);
++    } catch {
++      // pointer already released
++    }
++  }, []);
++
++  const onKeyDown = useCallback(
++    (event: React.KeyboardEvent<HTMLDivElement>) => {
++      if (event.key === "Home") {
++        event.preventDefault();
++        onChange(min);
++        return;
++      }
++      if (event.key === "End") {
++        event.preventDefault();
++        onChange(max);
++        return;
++      }
++      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
++      event.preventDefault();
++      const physical = event.key === "ArrowRight" ? 1 : -1;
++      const logical = edge === "end" ? physical : -physical;
++      const factor = event.shiftKey ? 5 : 1;
++      onChange(clamp(value + logical * 16 * factor));
++    },
++    [clamp, edge, max, min, onChange, value],
++  );
++
++  return (
++    <div
++      role="separator"
++      aria-orientation="vertical"
++      aria-label={label}
++      aria-valuemin={min}
++      aria-valuemax={max}
++      aria-valuenow={value}
++      tabIndex={disabled ? -1 : 0}
++      data-resizer={edge}
++      onPointerDown={onPointerDown}
++      onPointerMove={onPointerMove}
++      onPointerUp={endDrag}
++      onPointerCancel={endDrag}
++      onDoubleClick={() => onReset?.()}
++      onKeyDown={onKeyDown}
++      className={cn(
++        "group/resizer relative z-20 hidden w-2 shrink-0 cursor-col-resize touch-none select-none lg:flex",
++        "items-stretch justify-center",
++        "focus-visible:outline-none",
++        dragging && "bg-primary/10",
++        disabled && "pointer-events-none opacity-0",
++        className,
++      )}
++      title={label}
++    >
++      <span
++        aria-hidden
++        className={cn(
++          "my-2 w-px transition-colors",
++          dragging ? "bg-primary" : "bg-border/70 group-hover/resizer:bg-primary/60",
++        )}
++      />
++    </div>
++  );
++}
+diff --git a/web/src/components/ReasoningPicker.tsx b/web/src/components/ReasoningPicker.tsx
+index 7883f5886a..9bcfa3a5be 100644
+--- a/web/src/components/ReasoningPicker.tsx
++++ b/web/src/components/ReasoningPicker.tsx
+@@ -17,11 +17,18 @@
+  *
+  * Profile scoping: the sidebar passes the chat profile explicitly, so this
+  * reads/writes the same config the chat PTY was launched from.
++ *
++ * Why a local menu instead of the shared <Select>: that control renders its
++ * listbox `absolute` inside the trigger, so inside the chat sidebar (a
++ * scroll container with `overflow-x-hidden`) the options were clipped and the
++ * picker appeared to open "somewhere below" — or not at all. This menu portals
++ * to <body> with fixed positioning, flips up when there is no room below, and
++ * is therefore always fully visible.
+  */
+ 
+-import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
+-import { Brain } from "lucide-react";
+-import { useCallback, useEffect, useRef, useState } from "react";
++import { Check, ChevronDown } from "lucide-react";
++import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
++import { createPortal } from "react-dom";
+ 
+ import { api } from "@/lib/api";
+ import {
+@@ -29,6 +36,7 @@ import {
+   normalizeEffort,
+   VALID_EFFORTS,
+ } from "@/lib/reasoning-effort";
++import { cn } from "@/lib/utils";
+ 
+ interface ReasoningPickerProps {
+   /** Current model string from config — re-reads the saved effort when it
+@@ -43,6 +51,9 @@ interface ReasoningPickerProps {
+   onChanged?: (effort: string) => void;
+ }
+ 
++const MENU_GAP = 4;
++const VIEWPORT_MARGIN = 8;
++
+ export function ReasoningPicker({
+   currentModel,
+   profile,
+@@ -52,7 +63,16 @@ export function ReasoningPicker({
+   const [effort, setEffort] = useState("medium");
+   const [loaded, setLoaded] = useState(false);
+   const [saving, setSaving] = useState(false);
++  const [open, setOpen] = useState(false);
++  const [placement, setPlacement] = useState<{
++    left: number;
++    width: number;
++    top?: number;
++    bottom?: number;
++  } | null>(null);
+   const lastFetchKeyRef = useRef("");
++  const triggerRef = useRef<HTMLButtonElement>(null);
++  const menuRef = useRef<HTMLDivElement>(null);
+ 
+   useEffect(() => {
+     const fetchKey = `${profile ?? ""}:${currentModel}:${refreshKey}`;
+@@ -73,6 +93,7 @@ export function ReasoningPicker({
+ 
+   const onSelect = useCallback(
+     (next: string) => {
++      setOpen(false);
+       if (!VALID_EFFORTS.has(next) || next === effort) return;
+       const prev = effort;
+       setEffort(next); // optimistic
+@@ -94,24 +115,140 @@ export function ReasoningPicker({
+     [effort, onChanged, profile],
+   );
+ 
++  // Fixed-position the portaled menu against the trigger: below when it fits,
++  // otherwise above it (the sidebar sits mid-screen, so "below" often clips).
++  const position = useCallback(() => {
++    const rect = triggerRef.current?.getBoundingClientRect();
++    if (!rect) return;
++    const menuHeight = Math.min(EFFORT_OPTIONS.length * 34 + 8, 240);
++    const spaceBelow = window.innerHeight - rect.bottom;
++    const openUp = spaceBelow < menuHeight + MENU_GAP && rect.top > spaceBelow;
++    const width = Math.min(
++      Math.max(rect.width, 170),
++      window.innerWidth - VIEWPORT_MARGIN * 2,
++    );
++    const left = Math.min(
++      Math.max(rect.left, VIEWPORT_MARGIN),
++      window.innerWidth - width - VIEWPORT_MARGIN,
++    );
++    setPlacement(
++      openUp
++        ? {
++            left,
++            width,
++            bottom: Math.max(window.innerHeight - rect.top + MENU_GAP, VIEWPORT_MARGIN),
++          }
++        : { left, width, top: rect.bottom + MENU_GAP },
++    );
++  }, []);
++
++  useLayoutEffect(() => {
++    if (open) position();
++  }, [open, position]);
++
++  useEffect(() => {
++    if (!open) return;
++    const onDown = (e: MouseEvent) => {
++      const target = e.target as Node;
++      if (triggerRef.current?.contains(target)) return;
++      if (menuRef.current?.contains(target)) return;
++      setOpen(false);
++    };
++    const onKey = (e: KeyboardEvent) => {
++      if (e.key === "Escape") setOpen(false);
++    };
++    document.addEventListener("mousedown", onDown);
++    document.addEventListener("keydown", onKey);
++    // Any scroll (the sidebar, the page) invalidates the measured rect.
++    window.addEventListener("scroll", position, true);
++    window.addEventListener("resize", position);
++    return () => {
++      document.removeEventListener("mousedown", onDown);
++      document.removeEventListener("keydown", onKey);
++      window.removeEventListener("scroll", position, true);
++      window.removeEventListener("resize", position);
++    };
++  }, [open, position]);
++
++  const selected = EFFORT_OPTIONS.find((o) => o.value === effort);
++
+   return (
+-    <div className="flex items-center gap-2 px-3 py-2 text-xs">
+-      <div className="flex items-center gap-1.5 text-text-tertiary">
+-        <Brain className="h-3.5 w-3.5" />
++    <div className="flex min-w-0 items-center gap-2 px-3 py-2 text-xs">
++      <div className="flex shrink-0 items-center gap-1.5 text-text-tertiary">
+         <span className="text-display tracking-wider">reasoning</span>
+       </div>
+-      <Select
+-        className="ml-auto min-w-0"
++
++      <button
++        ref={triggerRef}
++        type="button"
++        className={cn(
++          "ml-auto flex h-8 w-full min-w-0 max-w-[11rem] items-center justify-between gap-2",
++          "border border-midground/15 bg-background/40 px-2.5 py-1",
++          "font-courier text-xs text-left text-midground transition-colors",
++          "hover:border-midground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground/30",
++          "disabled:cursor-not-allowed disabled:opacity-50",
++        )}
+         disabled={!loaded || saving}
+-        onValueChange={onSelect}
+-        value={effort}
++        onClick={() => setOpen((o) => !o)}
++        aria-expanded={open}
++        aria-haspopup="listbox"
++        aria-label={`Reasoning effort: ${selected?.label ?? effort}`}
+       >
+-        {EFFORT_OPTIONS.map((opt) => (
+-          <SelectOption key={opt.value} value={opt.value}>
+-            {opt.label}
+-          </SelectOption>
+-        ))}
+-      </Select>
++        <span className="truncate">{selected?.label ?? effort}</span>
++        <ChevronDown
++          className={cn(
++            "size-3 shrink-0 text-midground/60 transition-transform",
++            open && "rotate-180",
++          )}
++        />
++      </button>
++
++      {open &&
++        placement &&
++        createPortal(
++          <div
++            ref={menuRef}
++            role="listbox"
++            aria-label="Reasoning effort"
++            className={cn(
++              "fixed z-[130] max-h-60 overflow-y-auto",
++              "border border-midground/20 bg-background-base text-midground shadow-lg",
++            )}
++            style={{
++              left: placement.left,
++              width: placement.width,
++              top: placement.top,
++              bottom: placement.bottom,
++            }}
++          >
++            {EFFORT_OPTIONS.map((opt) => {
++              const isSelected = opt.value === effort;
++              return (
++                <button
++                  key={opt.value}
++                  type="button"
++                  role="option"
++                  aria-selected={isSelected}
++                  onClick={() => onSelect(opt.value)}
++                  className={cn(
++                    "flex w-full items-center gap-2 px-2.5 py-2 text-left",
++                    "font-courier text-xs transition-colors hover:bg-midground/10",
++                    isSelected ? "text-midground" : "text-midground/70",
++                  )}
++                >
++                  <Check
++                    className={cn(
++                      "size-3 shrink-0",
++                      isSelected ? "opacity-100" : "opacity-0",
++                    )}
++                  />
++                  <span className="truncate">{opt.label}</span>
++                </button>
++              );
++            })}
++          </div>,
++          document.body,
++        )}
+     </div>
+   );
+ }
+diff --git a/web/src/components/SessionActionsMenu.tsx b/web/src/components/SessionActionsMenu.tsx
+new file mode 100644
+index 0000000000..56c124efe9
+--- /dev/null
++++ b/web/src/components/SessionActionsMenu.tsx
+@@ -0,0 +1,147 @@
++import { useEffect, useLayoutEffect, useRef, useState } from "react";
++import { createPortal } from "react-dom";
++import type { LucideIcon } from "lucide-react";
++
++import { cn } from "@/lib/utils";
++
++export interface SessionMenuAction {
++  key: string;
++  label: string;
++  icon?: LucideIcon;
++  onSelect: () => void;
++  danger?: boolean;
++  disabled?: boolean;
++  /** Draw a divider above this item (grouping, e.g. destructive actions last). */
++  dividerBefore?: boolean;
++}
++
++/**
++ * A right-click / overflow menu for one session row.
++ *
++ * Portaled to `document.body` so the scrollable session rail can never clip
++ * it, then clamped to the viewport: a row near the bottom opens upward and a
++ * row near the right edge shifts left. Closes on outside pointerdown, Escape,
++ * scroll and resize, and restores focus to the trigger element.
++ */
++export function SessionActionsMenu({
++  x,
++  y,
++  actions,
++  onClose,
++  label,
++}: {
++  x: number;
++  y: number;
++  actions: SessionMenuAction[];
++  onClose: () => void;
++  label: string;
++}) {
++  const ref = useRef<HTMLDivElement>(null);
++  const [pos, setPos] = useState<{ left: number; top: number }>({ left: x, top: y });
++  const restoreFocusRef = useRef<Element | null>(null);
++
++  useLayoutEffect(() => {
++    const el = ref.current;
++    if (!el) return;
++    const rect = el.getBoundingClientRect();
++    const margin = 8;
++    const left = Math.min(
++      Math.max(margin, x),
++      Math.max(margin, window.innerWidth - rect.width - margin),
++    );
++    const top =
++      y + rect.height + margin > window.innerHeight
++        ? Math.max(margin, y - rect.height)
++        : Math.max(margin, y);
++    setPos({ left, top });
++  }, [x, y]);
++
++  useEffect(() => {
++    restoreFocusRef.current =
++      document.activeElement instanceof HTMLElement ? document.activeElement : null;
++    const first = ref.current?.querySelector<HTMLElement>("[role='menuitem']");
++    first?.focus({ preventScroll: true });
++
++    const onPointerDown = (event: PointerEvent) => {
++      if (!ref.current?.contains(event.target as Node)) onClose();
++    };
++    const onKeyDown = (event: KeyboardEvent) => {
++      if (event.key === "Escape") {
++        event.preventDefault();
++        onClose();
++        return;
++      }
++      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
++      const items = Array.from(
++        ref.current?.querySelectorAll<HTMLElement>("[role='menuitem']:not([disabled])") ?? [],
++      );
++      if (items.length === 0) return;
++      event.preventDefault();
++      const index = items.indexOf(document.activeElement as HTMLElement);
++      const step = event.key === "ArrowDown" ? 1 : -1;
++      const next = (index + step + items.length) % items.length;
++      items[next]?.focus({ preventScroll: true });
++    };
++    const close = () => onClose();
++
++    document.addEventListener("pointerdown", onPointerDown, true);
++    document.addEventListener("keydown", onKeyDown, true);
++    window.addEventListener("resize", close);
++    window.addEventListener("scroll", close, true);
++    return () => {
++      document.removeEventListener("pointerdown", onPointerDown, true);
++      document.removeEventListener("keydown", onKeyDown, true);
++      window.removeEventListener("resize", close);
++      window.removeEventListener("scroll", close, true);
++      if (restoreFocusRef.current instanceof HTMLElement) {
++        restoreFocusRef.current.focus({ preventScroll: true });
++      }
++    };
++  }, [onClose]);
++
++  return createPortal(
++    <div
++      ref={ref}
++      role="menu"
++      aria-label={label}
++      data-session-menu
++      className={cn(
++        "fixed z-[80] min-w-56 max-w-[calc(100vw-1rem)] py-1",
++        "border border-border bg-background-base text-foreground shadow-2xl",
++        "animate-[fade-in_120ms_ease-out]",
++      )}
++      style={{ left: pos.left, top: pos.top, direction: undefined }}
++    >
++      {actions.map((action) => {
++        const Icon = action.icon;
++        return (
++          <div key={action.key}>
++            {action.dividerBefore && <div className="my-1 border-t border-border" />}
++            <button
++              type="button"
++              role="menuitem"
++              disabled={action.disabled}
++              onClick={() => {
++                if (action.disabled) return;
++                onClose();
++                action.onSelect();
++              }}
++              className={cn(
++                "flex w-full items-center gap-2.5 px-3 py-1.5 text-start text-sm",
++                "normal-case tracking-normal",
++                action.danger
++                  ? "text-destructive hover:bg-destructive/10"
++                  : "text-foreground hover:bg-secondary/60",
++                action.disabled && "cursor-not-allowed opacity-40 hover:bg-transparent",
++              )}
++            >
++              {Icon ? <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden /> : null}
++              <span className="min-w-0 flex-1 truncate">{action.label}</span>
++            </button>
++          </div>
++        );
++      })}
++    </div>,
++    document.body,
++  );
++}
+diff --git a/web/src/components/SessionTranscript.tsx b/web/src/components/SessionTranscript.tsx
+new file mode 100644
+index 0000000000..fb6a7bd440
+--- /dev/null
++++ b/web/src/components/SessionTranscript.tsx
+@@ -0,0 +1,238 @@
++import { ArrowDown, MessageSquare, Terminal as TerminalIcon, Wrench } from "lucide-react";
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
++
++import { Markdown } from "@/components/Markdown";
++import { useI18n } from "@/i18n";
++import { api, type SessionMessage } from "@/lib/api";
++import { errorMessage } from "@/lib/api-error";
++import { cn, timeAgo } from "@/lib/utils";
++
++const REFRESH_MS = 3_000;
++
++/**
++ * Read-only transcript of the live chat session, rendered as message bubbles.
++ *
++ * The live Chat tab is a PTY/Ink surface — a terminal cannot give a Persian
++ * paragraph its own direction, or a Persian paragraph and an English heading
++ * different alignments. This view reads the same session from `state.db` and
++ * renders it as blocks, so RTL content reads correctly while the rest of the
++ * dashboard stays LTR. It refreshes while open; sending still happens in the
++ * terminal (the "Reply in terminal" action returns there).
++ */
++export function SessionTranscript({
++  sessionId,
++  profile,
++  onReplyInTerminal,
++}: {
++  sessionId: string | null;
++  profile?: string;
++  onReplyInTerminal: () => void;
++}) {
++  const { t } = useI18n();
++  const [messages, setMessages] = useState<SessionMessage[] | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [pinnedToBottom, setPinnedToBottom] = useState(true);
++  const scrollerRef = useRef<HTMLDivElement>(null);
++  const requestRef = useRef(0);
++
++  const load = useCallback(() => {
++    if (!sessionId) {
++      setMessages([]);
++      setError(null);
++      return;
++    }
++    const request = ++requestRef.current;
++    api
++      .getSessionMessages(sessionId, profile)
++      .then((response) => {
++        if (requestRef.current !== request) return;
++        setMessages(response.messages);
++        setError(null);
++      })
++      .catch((e) => {
++        if (requestRef.current === request) setError(errorMessage(e));
++      });
++  }, [profile, sessionId]);
++
++  useEffect(() => {
++    load();
++    const interval = window.setInterval(() => {
++      if (document.visibilityState === "visible") load();
++    }, REFRESH_MS);
++    return () => window.clearInterval(interval);
++  }, [load]);
++
++  // Follow the tail unless the reader scrolled up to look at history.
++  useEffect(() => {
++    if (!pinnedToBottom) return;
++    const el = scrollerRef.current;
++    if (el) el.scrollTop = el.scrollHeight;
++  }, [messages, pinnedToBottom]);
++
++  const onScroll = useCallback(() => {
++    const el = scrollerRef.current;
++    if (!el) return;
++    setPinnedToBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 96);
++  }, []);
++
++  const jumpToLatest = useCallback(() => {
++    const el = scrollerRef.current;
++    if (el) el.scrollTop = el.scrollHeight;
++    setPinnedToBottom(true);
++  }, []);
++
++  const visible = useMemo(
++    () => (messages ?? []).filter((message) => message.role !== "system").slice(-120),
++    [messages],
++  );
++
++  return (
++    <div className="absolute inset-0 z-10 flex min-h-0 flex-col bg-background-base">
++      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-current/15 px-3 py-1.5">
++        <span className="flex items-center gap-1.5 text-xs tracking-wide text-text-secondary">
++          <MessageSquare className="h-3.5 w-3.5" aria-hidden />
++          {t.app?.messagesView ?? "Messages"}
++          <span className="text-text-tertiary tabular-nums">
++            {visible.length}
++          </span>
++        </span>
++        <button
++          type="button"
++          onClick={onReplyInTerminal}
++          className={cn(
++            "flex items-center gap-1.5 border border-current/25 px-2 py-1 text-xs",
++            "text-text-secondary transition-colors hover:border-primary/50 hover:text-foreground",
++          )}
++        >
++          <TerminalIcon className="h-3.5 w-3.5" aria-hidden />
++          {t.app?.replyInTerminal ?? "Reply in terminal"}
++        </button>
++      </div>
++
++      <div
++        ref={scrollerRef}
++        onScroll={onScroll}
++        className="relative min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5"
++      >
++        {error && (
++          <div className="mb-3 border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
++            {error}
++          </div>
++        )}
++        {!sessionId && (
++          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-text-secondary">
++            {t.app?.transcriptEmpty ??
++              "Start a conversation in the terminal; its transcript appears here."}
++          </div>
++        )}
++        {sessionId && messages !== null && visible.length === 0 && !error && (
++          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-text-secondary">
++            {t.sessions.noMessages}
++          </div>
++        )}
++
++        <div className="mx-auto flex w-full max-w-4xl flex-col gap-3">
++          {visible.map((message, index) => (
++            <TranscriptMessage key={`${message.role}-${message.timestamp ?? index}-${index}`} message={message} />
++          ))}
++        </div>
++
++        {!pinnedToBottom && (
++          <button
++            type="button"
++            onClick={jumpToLatest}
++            aria-label={t.app?.jumpToLatest ?? "Jump to latest"}
++            className={cn(
++              "sticky bottom-2 ms-auto flex items-center gap-1 border border-current/25",
++              "bg-background-base/95 px-2 py-1 text-xs text-text-secondary shadow",
++              "hover:border-primary/50 hover:text-foreground",
++            )}
++          >
++            <ArrowDown className="h-3.5 w-3.5" aria-hidden />
++            {t.app?.jumpToLatest ?? "Latest"}
++          </button>
++        )}
++      </div>
++    </div>
++  );
++}
++
++function TranscriptMessage({ message }: { message: SessionMessage }) {
++  const { t, locale } = useI18n();
++  const isUser = message.role === "user";
++  const isTool = message.role === "tool";
++  const hasToolCalls = Boolean(message.tool_calls?.length);
++
++  if (isTool) {
++    return (
++      <details className="group min-w-0 border border-border bg-secondary/30">
++        <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs text-text-secondary">
++          <Wrench className="h-3.5 w-3.5 shrink-0" aria-hidden />
++          <span className="min-w-0 flex-1 truncate">
++            {message.tool_name ?? t.sessions.roles.tool}
++          </span>
++          {message.timestamp && (
++            <span className="shrink-0 text-text-tertiary">
++              {timeAgo(message.timestamp, locale)}
++            </span>
++          )}
++        </summary>
++        {message.content && (
++          <div className="border-t border-border px-3 py-2">
++            <Markdown content={message.content} />
++          </div>
++        )}
++      </details>
++    );
++  }
++
++  return (
++    <div
++      className={cn(
++        "flex min-w-0 flex-col gap-1",
++        isUser ? "items-end" : "items-stretch",
++      )}
++    >
++      <div className="flex items-center gap-2 px-1 text-[0.6875rem] text-text-tertiary">
++        <span className="font-semibold text-text-secondary">
++          {isUser ? t.sessions.roles.user : t.sessions.roles.assistant}
++        </span>
++        {message.timestamp && <span>{timeAgo(message.timestamp, locale)}</span>}
++        {hasToolCalls && (
++          <span className="flex items-center gap-1">
++            <Wrench className="h-3 w-3" aria-hidden />
++            {message.tool_calls!.length}
++          </span>
++        )}
++      </div>
++      <div
++        className={cn(
++          "hermes-message-bubble min-w-0 max-w-[min(100%,52rem)] border border-border px-3 py-2",
++          isUser
++            ? "rounded-s-lg rounded-ee-lg bg-primary/[0.08]"
++            : "rounded-e-lg rounded-es-lg bg-secondary/40",
++        )}
++      >
++        {message.content ? (
++          <Markdown content={message.content} />
++        ) : (
++          <span className="text-xs text-text-tertiary">
++            {t.common?.none ?? "—"}
++          </span>
++        )}
++        {hasToolCalls && (
++          <div className="mt-2 flex flex-wrap gap-1">
++            {message.tool_calls!.map((call) => (
++              <span
++                key={call.id}
++                className="border border-border px-1.5 py-0.5 font-mono text-[0.6875rem] text-text-secondary"
++              >
++                {call.function.name}
++              </span>
++            ))}
++          </div>
++        )}
++      </div>
 +    </div>
 +  );
 +}
@@ -547,10 +2504,33 @@ index e407988edf..a649670c78 100644
    tr,
    uk,
 diff --git a/web/src/i18n/en.ts b/web/src/i18n/en.ts
-index 67a30deffd..b4fb1b0594 100644
+index 67a30deffd..e5bd7af151 100644
 --- a/web/src/i18n/en.ts
 +++ b/web/src/i18n/en.ts
-@@ -86,9 +86,25 @@ export const en: Translations = {
+@@ -43,6 +43,22 @@ export const en: Translations = {
+     failedToReveal: "Failed to reveal",
+     collapse: "Collapse",
+     expand: "Expand",
++    rename: "Rename",
++    pin: "Pin",
++    unpin: "Unpin",
++    markRead: "Mark as read",
++    markUnread: "Mark as unread",
++    copyId: "Copy ID",
++    export: "Export",
++    archive: "Archive",
++    openInNewTab: "Open in new tab",
++    sessionIdCopied: "Session ID copied",
++    copyFailed: "Could not copy to the clipboard",
++    resizeSidebar: "Resize sidebar",
++    resizeChatPanel: "Resize session panel",
++    moreActions: "More actions",
++    autoCleanupHint:
++      "Empty sessions are removed automatically, so there is nothing to clean up.",
+     general: "General",
+     messaging: "Messaging",
+     gateway: "Gateway",
+@@ -86,9 +102,30 @@ export const en: Translations = {
        plugins: "Plugins",
        sessions: "Sessions",
        skills: "Skills",
@@ -563,6 +2543,11 @@ index 67a30deffd..b4fb1b0594 100644
      },
 -    modelToolsSheetSubtitle: "& tools",
      modelToolsSheetTitle: "Model",
++    terminalView: "Terminal",
++    messagesView: "Messages",
++    replyInTerminal: "Reply in terminal",
++    transcriptEmpty: "Start a conversation in the terminal; its transcript appears here.",
++    jumpToLatest: "Jump to latest",
 +    modelToolsSheetSubtitle: "& tools",
 +    chatComposer: {
 +      attach: "Attach files",
@@ -577,12 +2562,51 @@ index 67a30deffd..b4fb1b0594 100644
      navigation: "Navigation",
      openDocumentation: "Open documentation in a new tab",
      openNavigation: "Open navigation",
+@@ -222,6 +259,38 @@ export const en: Translations = {
+     workspaceCustom: "Other path…",
+     previousPage: "Previous page",
+     nextPage: "Next page",
++    pinned: "Pinned",
++    today: "Today",
++    yesterday: "Yesterday",
++    previous7Days: "Previous 7 days",
++    earlier: "Earlier",
++    searchSessions: "Search sessions…",
++    noSearchResults: "No sessions match your search",
++    actions: "Session actions",
++    emptyRuns: "Empty sessions are cleaned up automatically.",
++    total: "Total",
++    activeInStore: "Active in store",
++    archivedLabel: "Archived",
++    messagesLabel: "Messages",
++    sources: "Sources",
++    pruneTitle: "Prune old sessions",
++    pruneDescription:
++      "Permanently remove archived sessions whose last activity is older than the given number of days. Active sessions are never pruned.",
++    olderThanDays: "Older than (days)",
++    pruneAction: "Prune",
++    importSessions: "Import sessions",
++    importSessionsHint: "Import exported session JSON or JSONL",
++    renameSession: "Rename session",
++    sessionTitlePlaceholder: "Session title",
++    saveTitle: "Save title",
++    cancelRename: "Cancel rename",
++    exportSession: "Export session",
++    exportSessionHint: "Export session JSON",
++    sessionRenamed: "Session renamed",
++    failedToRename: "Failed to rename session",
++    failedToExport: "Failed to export session",
++    enterValidDays: "Enter a valid number of days",
++    failedToPrune: "Failed to prune sessions",
+     roles: {
+       user: "User",
+       assistant: "Assistant",
 diff --git a/web/src/i18n/fa.ts b/web/src/i18n/fa.ts
 new file mode 100644
-index 0000000000..c4d57960db
+index 0000000000..61b17fa4c7
 --- /dev/null
 +++ b/web/src/i18n/fa.ts
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,518 @@
 +import { defineLocale } from "./define-locale";
 +
 +/**
@@ -635,6 +2659,21 @@ index 0000000000..c4d57960db
 +    failedToReveal: "نمایش ناموفق بود",
 +    collapse: "جمع‌کردن",
 +    expand: "بازکردن",
++    rename: "تغییر نام",
++    pin: "سنجاق کردن",
++    unpin: "برداشتن سنجاق",
++    markRead: "علامت‌گذاری به‌عنوان خوانده‌شده",
++    markUnread: "علامت‌گذاری به‌عنوان خوانده‌نشده",
++    copyId: "کپی شناسه",
++    export: "خروجی",
++    archive: "بایگانی",
++    openInNewTab: "بازکردن در تب جدید",
++    sessionIdCopied: "شناسه نشست کپی شد",
++    copyFailed: "کپی در حافظه ممکن نشد",
++    resizeSidebar: "تغییر عرض نوار کناری",
++    resizeChatPanel: "تغییر عرض پنل نشست‌ها",
++    moreActions: "عملیات بیشتر",
++    autoCleanupHint: "نشست‌های خالی خودکار حذف می‌شوند؛ نیازی به پاک‌سازی دستی نیست.",
 +    general: "عمومی",
 +    messaging: "پیام‌رسانی",
 +    gateway: "گیتوی",
@@ -682,6 +2721,11 @@ index 0000000000..c4d57960db
 +      system: "سیستم",
 +    },
 +    modelToolsSheetTitle: "مدل",
++    terminalView: "ترمینال",
++    messagesView: "پیام‌ها",
++    replyInTerminal: "پاسخ در ترمینال",
++    transcriptEmpty: "در ترمینال گفتگو را شروع کنید؛ متن آن اینجا نمایش داده می‌شود.",
++    jumpToLatest: "پرش به آخرین",
 +    modelToolsSheetSubtitle: "و ابزارها",
 +    chatComposer: {
 +      attach: "افزودن فایل",
@@ -776,6 +2820,38 @@ index 0000000000..c4d57960db
 +    workspaceCustom: "مسیر دیگر…",
 +    previousPage: "صفحه قبل",
 +    nextPage: "صفحه بعد",
++    pinned: "سنجاق‌شده",
++    today: "امروز",
++    yesterday: "دیروز",
++    previous7Days: "۷ روز گذشته",
++    earlier: "پیش‌تر",
++    searchSessions: "جستجوی نشست‌ها…",
++    noSearchResults: "هیچ نشستی با جستجوی شما مطابقت ندارد",
++    actions: "عملیات نشست",
++    emptyRuns: "نشست‌های خالی خودکار پاک می‌شوند.",
++    total: "کل",
++    activeInStore: "فعال در انبار",
++    archivedLabel: "بایگانی‌شده",
++    messagesLabel: "پیام‌ها",
++    sources: "منابع",
++    pruneTitle: "هرس نشست‌های قدیمی",
++    pruneDescription:
++      "نشست‌های بایگانی‌شده‌ای را که آخرین فعالیتشان قدیمی‌تر از تعداد روز داده‌شده است برای همیشه حذف می‌کند. نشست‌های فعال هرگز هرس نمی‌شوند.",
++    olderThanDays: "قدیمی‌تر از (روز)",
++    pruneAction: "هرس",
++    importSessions: "درون‌ریزی نشست‌ها",
++    importSessionsHint: "درون‌ریزی JSON یا JSONL خروجی‌گرفته‌شده",
++    renameSession: "تغییر نام نشست",
++    sessionTitlePlaceholder: "عنوان نشست",
++    saveTitle: "ذخیره عنوان",
++    cancelRename: "انصراف از تغییر نام",
++    exportSession: "خروجی نشست",
++    exportSessionHint: "خروجی JSON نشست",
++    sessionRenamed: "نام نشست تغییر کرد",
++    failedToRename: "تغییر نام نشست ناموفق بود",
++    failedToExport: "خروجی‌گیری نشست ناموفق بود",
++    enterValidDays: "تعداد روز معتبر وارد کنید",
++    failedToPrune: "هرس نشست‌ها ناموفق بود",
 +    roles: {
 +      user: "کاربر",
 +      assistant: "دستیار",
@@ -1050,7 +3126,7 @@ index 0000000000..c4d57960db
 +  },
 +});
 diff --git a/web/src/i18n/types.ts b/web/src/i18n/types.ts
-index 9ee3e901de..19108d37fa 100644
+index 9ee3e901de..071c834804 100644
 --- a/web/src/i18n/types.ts
 +++ b/web/src/i18n/types.ts
 @@ -5,6 +5,7 @@ export type Locale =
@@ -1061,7 +3137,29 @@ index 9ee3e901de..19108d37fa 100644
    | "fr"
    | "tr"
    | "uk"
-@@ -105,9 +106,25 @@ export interface Translations {
+@@ -62,6 +63,21 @@ export interface Translations {
+     failedToReveal: string;
+     collapse: string;
+     expand: string;
++    rename?: string;
++    pin?: string;
++    unpin?: string;
++    markRead?: string;
++    markUnread?: string;
++    copyId?: string;
++    export?: string;
++    archive?: string;
++    openInNewTab?: string;
++    sessionIdCopied?: string;
++    copyFailed?: string;
++    resizeSidebar?: string;
++    resizeChatPanel?: string;
++    moreActions?: string;
++    autoCleanupHint?: string;
+     general: string;
+     messaging: string;
+     // Optional: non-English locales fall back to the English literal in the
+@@ -105,9 +121,30 @@ export interface Translations {
        plugins: string;
        sessions: string;
        skills: string;
@@ -1074,6 +3172,11 @@ index 9ee3e901de..19108d37fa 100644
      };
      modelToolsSheetSubtitle: string;
      modelToolsSheetTitle: string;
++    terminalView?: string;
++    messagesView?: string;
++    replyInTerminal?: string;
++    transcriptEmpty?: string;
++    jumpToLatest?: string;
 +    chatComposer?: {
 +      attach: string;
 +      uploading: string;
@@ -1087,6 +3190,121 @@ index 9ee3e901de..19108d37fa 100644
      navigation: string;
      openDocumentation: string;
      openNavigation: string;
+@@ -234,6 +271,37 @@ export interface Translations {
+     workspaceCustom: string;
+     previousPage: string;
+     nextPage: string;
++    pinned?: string;
++    today?: string;
++    yesterday?: string;
++    previous7Days?: string;
++    earlier?: string;
++    searchSessions?: string;
++    noSearchResults?: string;
++    actions?: string;
++    emptyRuns?: string;
++    total?: string;
++    activeInStore?: string;
++    archivedLabel?: string;
++    messagesLabel?: string;
++    sources?: string;
++    pruneTitle?: string;
++    pruneDescription?: string;
++    olderThanDays?: string;
++    pruneAction?: string;
++    importSessions?: string;
++    importSessionsHint?: string;
++    renameSession?: string;
++    sessionTitlePlaceholder?: string;
++    saveTitle?: string;
++    cancelRename?: string;
++    exportSession?: string;
++    exportSessionHint?: string;
++    sessionRenamed?: string;
++    failedToRename?: string;
++    failedToExport?: string;
++    enterValidDays?: string;
++    failedToPrune?: string;
+     roles: {
+       user: string;
+       assistant: string;
+diff --git a/web/src/index.css b/web/src/index.css
+index e4b5e2777f..fcb5f3e1fc 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -253,3 +253,33 @@ html[dir="rtl"] {
+   direction: rtl;
+ }
+ 
++/* Per-block text direction for agent output.
++   `unicode-bidi: plaintext` resolves each line from its own first strong
++   character, so a mixed reply (English heading, Persian paragraph, shell
++   command) lays out correctly without flipping the rest of the dashboard.
++   Code stays LTR even inside an RTL block. `text-align: start` follows the
++   resolved direction (right for RTL, left for LTR). */
++.hermes-md-block {
++  unicode-bidi: plaintext;
++  text-align: start;
++}
++
++.hermes-md-block li {
++  text-align: start;
++}
++
++.hermes-md-code,
++.hermes-md-code code,
++.hermes-md code[dir="ltr"] {
++  unicode-bidi: isolate;
++  direction: ltr;
++}
++
++/* Session transcript bubbles: keep long unbroken tokens (paths, hashes,
++   URLs) from forcing a horizontal scrollbar inside a bubble. */
++.hermes-message-bubble {
++  overflow-wrap: anywhere;
++  word-break: normal;
++}
++
++
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 64cf129921..82faff47f7 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -541,6 +541,23 @@ export const api = {
+     }),
+   renameSession: (id: string, title: string, profile = getManagementProfile()) =>
+     mutateSessionHttp<{ ok: boolean; title: string }>(id, "PATCH", { title }, profile),
++  /**
++   * Update sidebar metadata on one session. The backend accepts any subset of
++   * `title` / `pinned` / `unread` / `archived` / `hidden` and returns the
++   * authoritative revision receipt; callers only care that it committed.
++   */
++  patchSession: (
++    id: string,
++    fields: {
++      title?: string;
++      pinned?: boolean;
++      unread?: boolean;
++      archived?: boolean;
++      hidden?: boolean;
++    },
++    profile = getManagementProfile(),
++  ) =>
++    mutateSessionHttp<{ ok: boolean }>(id, "PATCH", fields, profile),
+   getSessionStats: (profile = getManagementProfile()) =>
+     fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
+   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
+@@ -2133,6 +2150,10 @@ export interface SessionInfo {
+   output_tokens: number;
+   preview: string | null;
+   parent_session_id?: string | null;
++  /** Sidebar metadata from the session store (absent on older rows). */
++  pinned?: boolean;
++  unread?: boolean;
++  archived?: boolean;
+   /** Owning profile stamped by the list/detail endpoints (the store the row
+    * was read from). Absent on search-endpoint rows, which carry no stamp. */
+   profile?: string;
 diff --git a/web/src/lib/chat-attachments.test.ts b/web/src/lib/chat-attachments.test.ts
 new file mode 100644
 index 0000000000..832f16d7ca
@@ -1222,6 +3440,127 @@ index 0000000000..806814ff57
 +  }
 +  return uploaded;
 +}
+diff --git a/web/src/lib/chat-tabs.test.ts b/web/src/lib/chat-tabs.test.ts
+new file mode 100644
+index 0000000000..63a89e9ffe
+--- /dev/null
++++ b/web/src/lib/chat-tabs.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  NEW_TAB_ID,
++  removeChatTab,
++  sessionTitleOrFallback,
++  upsertChatTab,
++  type ChatTab,
++} from "./chat-tabs";
++
++const tab = (id: string, title = id): ChatTab => ({ id, title });
++
++describe("chat tabs", () => {
++  it("appends new tabs and updates existing ones in place", () => {
++    const first = upsertChatTab([], tab("a"));
++    const second = upsertChatTab(first, tab("b"));
++    expect(second.map((item) => item.id)).toEqual(["a", "b"]);
++
++    const renamed = upsertChatTab(second, tab("a", "new title"));
++    expect(renamed).toHaveLength(2);
++    expect(renamed[0]).toEqual({ id: "a", title: "new title" });
++  });
++
++  it("caps the strip at twelve tabs, dropping the oldest", () => {
++    let tabs: ChatTab[] = [];
++    for (let index = 0; index < 15; index += 1) {
++      tabs = upsertChatTab(tabs, tab(`s${index}`));
++    }
++    expect(tabs).toHaveLength(12);
++    expect(tabs[0].id).toBe("s3");
++    expect(tabs.at(-1)?.id).toBe("s14");
++  });
++
++  it("removes one tab without touching the rest", () => {
++    const tabs = [tab("a"), tab(NEW_TAB_ID, "New chat"), tab("b")];
++    expect(removeChatTab(tabs, NEW_TAB_ID).map((item) => item.id)).toEqual(["a", "b"]);
++  });
++
++  it("falls back from a placeholder title to the preview, then the label", () => {
++    expect(sessionTitleOrFallback({ title: "Untitled", preview: "hello" }, "New")).toBe(
++      "hello",
++    );
++    expect(sessionTitleOrFallback({ title: null, preview: null }, "New")).toBe("New");
++    expect(sessionTitleOrFallback({ title: "Real", preview: "ignored" }, "New")).toBe(
++      "Real",
++    );
++  });
++});
+diff --git a/web/src/lib/chat-tabs.ts b/web/src/lib/chat-tabs.ts
+new file mode 100644
+index 0000000000..795ddcf53a
+--- /dev/null
++++ b/web/src/lib/chat-tabs.ts
+@@ -0,0 +1,61 @@
++/** Persisted "open session" tabs for the chat tab strip. */
++export interface ChatTab {
++  /** Session id, or `NEW_TAB_ID` for an unsaved draft. */
++  id: string;
++  title: string;
++}
++
++export const NEW_TAB_ID = "__new__";
++const STORAGE_KEY = "hermes-chat-tabs";
++const MAX_TABS = 12;
++
++export function readChatTabs(): ChatTab[] {
++  try {
++    const raw = localStorage.getItem(STORAGE_KEY);
++    if (!raw) return [];
++    const parsed: unknown = JSON.parse(raw);
++    if (!Array.isArray(parsed)) return [];
++    return parsed
++      .filter(
++        (tab): tab is ChatTab =>
++          Boolean(tab) &&
++          typeof (tab as ChatTab).id === "string" &&
++          typeof (tab as ChatTab).title === "string",
++      )
++      .slice(0, MAX_TABS);
++  } catch {
++    return [];
++  }
++}
++
++export function writeChatTabs(tabs: ChatTab[]): void {
++  try {
++    localStorage.setItem(STORAGE_KEY, JSON.stringify(tabs.slice(0, MAX_TABS)));
++  } catch {
++    // ignore quota / privacy mode
++  }
++}
++
++/** Add or update a tab, keeping insertion order and the cap. */
++export function upsertChatTab(tabs: ChatTab[], tab: ChatTab): ChatTab[] {
++  const index = tabs.findIndex((t) => t.id === tab.id);
++  if (index === -1) return [...tabs, tab].slice(-MAX_TABS);
++  const next = tabs.slice();
++  next[index] = tab;
++  return next;
++}
++
++export function removeChatTab(tabs: ChatTab[], id: string): ChatTab[] {
++  return tabs.filter((tab) => tab.id !== id);
++}
++
++export function sessionTitleOrFallback(
++  session: { title?: string | null; preview?: string | null },
++  fallback: string,
++): string {
++  const title = session.title?.trim();
++  if (title && title !== "Untitled") return title;
++  const preview = session.preview?.trim();
++  if (preview) return preview.slice(0, 42);
++  return fallback;
++}
 diff --git a/web/src/lib/resolve-page-title.ts b/web/src/lib/resolve-page-title.ts
 index 15fa5b3824..62fe151f95 100644
 --- a/web/src/lib/resolve-page-title.ts
@@ -1248,19 +3587,326 @@ index 15fa5b3824..62fe151f95 100644
    }
    const literal = BUILTIN_LITERAL[normalized];
    if (literal) {
+diff --git a/web/src/lib/session-groups.test.ts b/web/src/lib/session-groups.test.ts
+new file mode 100644
+index 0000000000..da1edb2a67
+--- /dev/null
++++ b/web/src/lib/session-groups.test.ts
+@@ -0,0 +1,70 @@
++import { describe, expect, it } from "vitest";
++
++import type { SessionInfo } from "./api";
++import { groupSessions, matchesSessionQuery } from "./session-groups";
++
++function session(overrides: Partial<SessionInfo> & { id: string }): SessionInfo {
++  const now = Date.now() / 1000;
++  const base: Omit<SessionInfo, "id"> = {
++    source: "cli",
++    model: "deepseek-flash",
++    title: "Session",
++    started_at: now - 60,
++    ended_at: null,
++    last_active: now - 60,
++    is_active: false,
++    message_count: 2,
++    tool_call_count: 0,
++    input_tokens: 0,
++    output_tokens: 0,
++    preview: null,
++  };
++  return { ...base, ...overrides };
++}
++
++describe("groupSessions", () => {
++  const now = Date.now() / 1000;
++  const day = 86_400;
++
++  it("puts pinned rows first and buckets the rest by calendar day", () => {
++    const groups = groupSessions([
++      session({ id: "pinned", pinned: true, last_active: now - 30 * day }),
++      session({ id: "today", last_active: now - 60 }),
++      session({ id: "yesterday", last_active: now - day - 60 }),
++      session({ id: "week", last_active: now - 3 * day }),
++      session({ id: "earlier", last_active: now - 20 * day }),
++    ]);
++
++    expect(groups.map((group) => group.key)).toEqual([
++      "pinned",
++      "today",
++      "yesterday",
++      "week",
++      "earlier",
++    ]);
++    expect(groups.flatMap((group) => group.sessions.map((row) => row.id))).toEqual([
++      "pinned",
++      "today",
++      "yesterday",
++      "week",
++      "earlier",
++    ]);
++  });
++
++  it("omits empty buckets", () => {
++    const groups = groupSessions([session({ id: "only", last_active: now - 60 })]);
++    expect(groups).toHaveLength(1);
++    expect(groups[0].key).toBe("today");
++  });
++});
++
++describe("matchesSessionQuery", () => {
++  it("matches title, model and id, case-insensitively", () => {
++    const row = session({ id: "abc123", title: "گزارشکار آزمایش" });
++    expect(matchesSessionQuery(row, "گزارشکار")).toBe(true);
++    expect(matchesSessionQuery(row, "DEEPSEEK")).toBe(true);
++    expect(matchesSessionQuery(row, "abc123")).toBe(true);
++    expect(matchesSessionQuery(row, "missing")).toBe(false);
++    expect(matchesSessionQuery(row, "   ")).toBe(true);
++  });
++});
+diff --git a/web/src/lib/session-groups.ts b/web/src/lib/session-groups.ts
+new file mode 100644
+index 0000000000..615239f3ed
+--- /dev/null
++++ b/web/src/lib/session-groups.ts
+@@ -0,0 +1,72 @@
++import type { SessionInfo } from "@/lib/api";
++
++export type SessionGroupKey = "pinned" | "today" | "yesterday" | "week" | "earlier";
++
++export interface SessionGroup {
++  key: SessionGroupKey;
++  sessions: SessionInfo[];
++}
++
++function startOfDay(ts: number): number {
++  const d = new Date(ts * 1000);
++  d.setHours(0, 0, 0, 0);
++  return d.getTime();
++}
++
++function seconds(value: number | null | undefined): number {
++  if (!value || !Number.isFinite(value)) return 0;
++  // Session rows are epoch seconds. Ignore millisecond values by scaling.
++  return value > 1e12 ? Math.round(value / 1000) : value;
++}
++
++/**
++ * Group sessions the way the desktop sidebar does: pinned rows first, then
++ * calendar buckets (Today, Yesterday, Previous 7 days, Earlier). Sessions are
++ * kept in the order the API returned them inside each bucket, so "recent"
++ * ordering is preserved. Empty groups are omitted.
++ */
++export function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
++  const now = new Date();
++  const today = startOfDay(now.getTime() / 1000);
++  const yesterday = today - 86_400_000;
++  const week = today - 7 * 86_400_000;
++
++  const groups: SessionGroup[] = [
++    { key: "pinned", sessions: [] },
++    { key: "today", sessions: [] },
++    { key: "yesterday", sessions: [] },
++    { key: "week", sessions: [] },
++    { key: "earlier", sessions: [] },
++  ];
++  const byKey = new Map(groups.map((g) => [g.key, g]));
++
++  for (const session of sessions) {
++    if (session.pinned) {
++      byKey.get("pinned")!.sessions.push(session);
++      continue;
++    }
++    const day = startOfDay(seconds(session.last_active) || seconds(session.started_at));
++    if (day >= today) byKey.get("today")!.sessions.push(session);
++    else if (day >= yesterday) byKey.get("yesterday")!.sessions.push(session);
++    else if (day >= week) byKey.get("week")!.sessions.push(session);
++    else byKey.get("earlier")!.sessions.push(session);
++  }
++
++  return groups.filter((group) => group.sessions.length > 0);
++}
++
++export function matchesSessionQuery(session: SessionInfo, query: string): boolean {
++  const needle = query.trim().toLowerCase();
++  if (!needle) return true;
++  const haystack = [
++    session.title,
++    session.preview,
++    session.model,
++    session.source,
++    session.id,
++  ]
++    .filter(Boolean)
++    .join(" ")
++    .toLowerCase();
++  return needle.split(/\s+/).every((part) => haystack.includes(part));
++}
+diff --git a/web/src/lib/text-direction.test.ts b/web/src/lib/text-direction.test.ts
+new file mode 100644
+index 0000000000..d178e304a8
+--- /dev/null
++++ b/web/src/lib/text-direction.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from "vitest";
++
++import { blockDirection, hasRtlText } from "./text-direction";
++
++describe("text direction", () => {
++  it("detects Persian and Arabic as RTL", () => {
++    expect(hasRtlText("سلام دنیا")).toBe(true);
++    expect(hasRtlText("مرحبا بالعالم")).toBe(true);
++  });
++
++  it("leaves English, code and paths LTR", () => {
++    expect(hasRtlText("hello world")).toBe(false);
++    expect(hasRtlText("C:\\Users\\ASUS\\state.db")).toBe(false);
++    expect(hasRtlText("```py\nprint('hi')\n```")).toBe(false);
++    expect(hasRtlText("")).toBe(false);
++    expect(hasRtlText(null)).toBe(false);
++  });
++
++  it("resolves a block from its first strong character", () => {
++    expect(blockDirection("سلام hello")).toBe("rtl");
++    expect(blockDirection("hello سلام")).toBe("ltr");
++    expect(blockDirection("12345")).toBeUndefined();
++  });
++});
+diff --git a/web/src/lib/text-direction.ts b/web/src/lib/text-direction.ts
+new file mode 100644
+index 0000000000..0db4d1fab4
+--- /dev/null
++++ b/web/src/lib/text-direction.ts
+@@ -0,0 +1,52 @@
++/**
++ * Text direction helpers for mixed English / Persian / Arabic content.
++ *
++ * The dashboard flips its whole shell when the locale is RTL, but agent
++ * output is mixed: one assistant reply can hold an English summary, a
++ * Persian paragraph, a shell command and a JSON blob. Direction is resolved
++ * per block instead of per page so a Persian paragraph reads right-to-left
++ * while the surrounding dashboard (and every code block) stays LTR.
++ *
++ * `unicode-bidi: plaintext` does the heavy lifting in CSS (`index.css`,
++ * `.hermes-md-block`): each rendered line picks its direction from its own
++ * first strong character. These helpers cover the cases CSS cannot:
++ * elements whose chrome (list markers, quote borders) needs a box-level
++ * direction, and callers that want to know whether a string is RTL at all.
++ */
++
++/** Strong RTL code points: Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan,
++ *  Arabic Extended, presentation forms. Digits/punctuation are neutral. */
++const RTL_CHAR =
++  /[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0750-\u077F\u0780-\u07BF\u07C0-\u07FF\u0800-\u083F\u0840-\u085F\u0860-\u086F\u0870-\u089F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
++
++/** True when `text` contains at least one strong right-to-left character. */
++export function hasRtlText(text: string | null | undefined): boolean {
++  return typeof text === "string" && RTL_CHAR.test(text);
++}
++
++/**
++ * Direction for a block box: `"rtl"` when the first strong character is
++ * RTL, `"ltr"` when it is LTR, `undefined` when the text is neutral (pure
++ * digits, punctuation, emoji) — then the surrounding block decides.
++ */
++export function blockDirection(
++  text: string | null | undefined,
++): "rtl" | "ltr" | undefined {
++  if (typeof text !== "string") return undefined;
++  for (const char of text) {
++    if (RTL_CHAR.test(char)) return "rtl";
++    if (/[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF]/.test(char)) {
++      return "ltr";
++    }
++  }
++  return undefined;
++}
++
++/**
++ * `dir` attribute value for a text block. `"auto"` lets the browser resolve
++ * direction per element from its content (the HTML standard, same rule as
++ * `blockDirection`), which is what we want for markdown paragraphs.
++ */
++export function autoDir(text: string | null | undefined): "auto" | "ltr" {
++  return hasRtlText(text) ? "auto" : "ltr";
++}
+diff --git a/web/src/lib/utils.ts b/web/src/lib/utils.ts
+index c9fb44d4a7..fc87cbb103 100644
+--- a/web/src/lib/utils.ts
++++ b/web/src/lib/utils.ts
+@@ -15,13 +15,27 @@ export const themedBody = "font-mondwest normal-case";
+ export const themedChrome = "font-mondwest text-display";
+ 
+ /** Relative time from a Unix epoch timestamp (seconds). */
+-export function timeAgo(ts: number): string {
++export function timeAgo(ts: number, locale?: string): string {
+   const delta = Date.now() / 1000 - ts;
+-  if (delta < 60) return "just now";
+-  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+-  if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
+-  if (delta < 172800) return "yesterday";
+-  return `${Math.floor(delta / 86400)}d ago`;
++  const rtl = locale === "fa" || locale === "ar";
++  if (delta < 60) return rtl ? (locale === "fa" ? "همین حالا" : "الآن") : "just now";
++  if (delta < 3600) {
++    const n = Math.floor(delta / 60);
++    return rtl
++      ? locale === "fa" ? `${n} دقیقه پیش` : `قبل ${n} دقيقة`
++      : `${n}m ago`;
++  }
++  if (delta < 86400) {
++    const n = Math.floor(delta / 3600);
++    return rtl
++      ? locale === "fa" ? `${n} ساعت پیش` : `قبل ${n} ساعة`
++      : `${n}h ago`;
++  }
++  if (delta < 172800) return rtl ? (locale === "fa" ? "دیروز" : "أمس") : "yesterday";
++  const n = Math.floor(delta / 86400);
++  return rtl
++    ? locale === "fa" ? `${n} روز پیش` : `قبل ${n} يوم`
++    : `${n}d ago`;
+ }
+ 
+ /** Relative time from an ISO-8601 timestamp string. */
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index e488ea125b..8ef900b011 100644
+index e488ea125b..f50dce0d7a 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
-@@ -32,6 +32,7 @@ import { useNavigate, useSearchParams } from "react-router";
+@@ -25,19 +25,32 @@ import "@xterm/xterm/css/xterm.css";
+ import { Button } from "@nous-research/ui/ui/components/button";
+ import { Typography } from "@nous-research/ui/ui/components/typography/index";
+ import { cn } from "@/lib/utils";
+-import { PanelRight, RotateCcw, X } from "lucide-react";
++import { MessageSquare, PanelRight, RotateCcw, SquareTerminal, X } from "lucide-react";
+ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+ import { createPortal } from "react-dom";
+ import { useNavigate, useSearchParams } from "react-router";
  
  import { ChatSidebar } from "@/components/ChatSidebar";
  import { ChatSessionList } from "@/components/ChatSessionList";
++import { ChatTabs } from "@/components/ChatTabs";
++import { SessionTranscript } from "@/components/SessionTranscript";
++import { PaneResizer } from "@/components/PaneResizer";
 +import { ChatAttachmentBar } from "@/components/ChatAttachmentBar";
  import { usePageHeader } from "@/contexts/usePageHeader";
  import { useI18n } from "@/i18n";
- import { api } from "@/lib/api";
-@@ -80,6 +81,7 @@ import {
+-import { api } from "@/lib/api";
++import { api, type SessionInfo } from "@/lib/api";
+ import { readStoredWorkspace, writeStoredWorkspace } from "@/lib/chat-workspaces";
+ import { latchChatActivation } from "@/lib/chat-activation";
+ import { readChatPanelCollapsed, toggleChatPanelCollapsed } from "@/lib/chat-panel-collapsed";
++import {
++  NEW_TAB_ID,
++  readChatTabs,
++  removeChatTab,
++  sessionTitleOrFallback,
++  upsertChatTab,
++  writeChatTabs,
++  type ChatTab,
++} from "@/lib/chat-tabs";
+ import { copyTextToClipboard } from "@/lib/clipboard";
+ import { normalizeSessionTitle } from "@/lib/chat-title";
+ import { createPtyCompositionForwarder } from "@/lib/pty-composition";
+@@ -80,6 +93,7 @@ import {
  import { installTerminalTouchScroll } from "@/lib/terminal-touch-scroll";
  import { uploadChatImage } from "@/lib/chatImagePaste";
  import { attachChatImageDropListeners } from "@/lib/chat-image-drop";
@@ -1268,7 +3914,7 @@ index e488ea125b..8ef900b011 100644
  import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
  import {
    PTY_GAVE_UP_BANNER,
-@@ -130,6 +132,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -130,6 +144,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
    const termRef = useRef<Terminal | null>(null);
    const fitRef = useRef<FitAddon | null>(null);
    const wsRef = useRef<WebSocket | null>(null);
@@ -1281,10 +3927,150 @@ index e488ea125b..8ef900b011 100644
    const isActiveRef = useRef(isActive);
    useEffect(() => {
      isActiveRef.current = isActive;
-@@ -365,6 +373,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -291,6 +311,60 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+   const [chatPanelCollapsed, setChatPanelCollapsed] = useState(
+     readChatPanelCollapsed,
+   );
++  const CHAT_PANEL_WIDTH_KEY = "hermes-chat-panel-width";
++  const CHAT_PANEL_DEFAULT_WIDTH = 260;
++  const CHAT_PANEL_MIN_WIDTH = 208;
++  const CHAT_PANEL_MAX_WIDTH = 380;
++  const readChatPanelWidth = () => {
++    try {
++      const raw = Number(localStorage.getItem(CHAT_PANEL_WIDTH_KEY));
++      if (raw >= CHAT_PANEL_MIN_WIDTH && raw <= CHAT_PANEL_MAX_WIDTH) {
++        return Math.round(raw);
++      }
++    } catch {
++      // ignore
++    }
++    return CHAT_PANEL_DEFAULT_WIDTH;
++  };
++  const [chatPanelWidth, setChatPanelWidth] = useState(readChatPanelWidth);
++  const resizeChatPanel = useCallback((next: number) => {
++    setChatPanelWidth(next);
++    try {
++      localStorage.setItem(CHAT_PANEL_WIDTH_KEY, String(next));
++    } catch {
++      // ignore
++    }
++  }, []);
++  const resetChatPanelWidth = useCallback(() => {
++    setChatPanelWidth(CHAT_PANEL_DEFAULT_WIDTH);
++    try {
++      localStorage.removeItem(CHAT_PANEL_WIDTH_KEY);
++    } catch {
++      // ignore
++    }
++  }, []);
++
++  // Terminal is the live surface; "messages" is a read-only bubble view of
++  // the same session for RTL-heavy replies. The PTY stays mounted underneath
++  // either way, so switching never drops the connection.
++  const CHAT_VIEW_KEY = "hermes-chat-view";
++  const [chatView, setChatViewState] = useState<"terminal" | "messages">(() => {
++    try {
++      return localStorage.getItem(CHAT_VIEW_KEY) === "messages"
++        ? "messages"
++        : "terminal";
++    } catch {
++      return "terminal";
++    }
++  });
++  const setChatView = useCallback((view: "terminal" | "messages") => {
++    setChatViewState(view);
++    try {
++      localStorage.setItem(CHAT_VIEW_KEY, view);
++    } catch {
++      // ignore
++    }
++  }, []);
+   const toggleChatPanel = useCallback(() => {
+     setChatPanelCollapsed(toggleChatPanelCollapsed);
+   }, []);
+@@ -328,6 +402,45 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+   // treat the current resume target as part of the PTY identity and rebuild the
+   // terminal session when it changes.
+   const resumeParam = searchParams.get("resume");
++  // ── Open-conversation tabs ────────────────────────────────────────────
++  // The tab strip is a navigation surface over the same `?resume=` identity
++  // the PTY already keys on. Tabs survive reloads; the active tab is derived
++  // from the URL, so deep links and the Sessions page stay in sync.
++  const [chatTabs, setChatTabs] = useState<ChatTab[]>(readChatTabs);
++  const activeTabId = resumeParam ?? NEW_TAB_ID;
++  useEffect(() => {
++    writeChatTabs(chatTabs);
++  }, [chatTabs]);
++
++  const selectChatTab = useCallback(
++    (tab: ChatTab) => {
++      if (tab.id === NEW_TAB_ID) {
++        startFreshDashboardChat();
++        return;
++      }
++      setSearchParams(
++        (prev) => {
++          const next = new URLSearchParams(prev);
++          next.set("resume", tab.id);
++          return next;
++        },
++        { replace: false },
++      );
++    },
++    [setSearchParams, startFreshDashboardChat],
++  );
++
++  const closeChatTab = useCallback(
++    (tab: ChatTab) => {
++      const next = removeChatTab(chatTabs, tab.id);
++      setChatTabs(next);
++      if (tab.id !== activeTabId) return;
++      const fallback = next.filter((candidate) => candidate.id !== NEW_TAB_ID).at(-1);
++      if (fallback) selectChatTab(fallback);
++      else startFreshDashboardChat();
++    },
++    [activeTabId, chatTabs, selectChatTab, startFreshDashboardChat],
++  );
+   // Profile-scoped chat: spawn the PTY under the globally selected
+   // management profile. Changing it remounts the terminal (key below /
+   // effect dep) so the user explicitly starts a fresh scoped session.
+@@ -365,6 +478,57 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
      [titleScope],
    );
  
++  // Keep the tab strip in sync with the URL and the live session title.
++  // A fresh chat gets a draft tab; a resumed chat gets (or refreshes) its own
++  // tab so opening a session from the rail, a deep link or the Sessions page
++  // all show up in the same strip.
++  useEffect(() => {
++    if (!resumeParam) {
++      setChatTabs((prev) =>
++        prev.some((tab) => tab.id === NEW_TAB_ID)
++          ? prev
++          : upsertChatTab(prev, { id: NEW_TAB_ID, title: t.sessions?.newChat ?? "New chat" }),
++      );
++      return;
++    }
++    setChatTabs((prev) => {
++      const existing = prev.find((tab) => tab.id === resumeParam);
++      const title =
++        sessionTitle ?? existing?.title ?? (t.sessions?.untitledSession ?? "Untitled session");
++      return upsertChatTab(prev, { id: resumeParam, title });
++    });
++  }, [resumeParam, sessionTitle, t.sessions?.newChat, t.sessions?.untitledSession]);
++
++  const openSessionTab = useCallback(
++    (session: SessionInfo) => {
++      setChatTabs((prev) =>
++        upsertChatTab(prev, {
++          id: session.id,
++          title: sessionTitleOrFallback(session, t.sessions?.untitledSession ?? "Untitled session"),
++        }),
++      );
++    },
++    [t.sessions?.untitledSession],
++  );
++
 +  const handleFilesChange = useCallback((files: ChatAttachment[]) => {
 +    pendingFilesRef.current = files;
 +  }, []);
@@ -1306,7 +4092,7 @@ index e488ea125b..8ef900b011 100644
    useLayoutEffect(() => {
      if (!isActive) {
        setTitle(null);
-@@ -614,25 +640,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -614,25 +778,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
        console.warn("[dashboard chat] image upload failed:", message);
        setBanner(`Image upload failed: ${message}`);
      };
@@ -1338,7 +4124,7 @@ index e488ea125b..8ef900b011 100644
      const uploadAndAttachImages = (files: File[]) => {
        if (!files.length) return;
        void (async () => {
-@@ -1509,6 +1537,41 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -1509,6 +1675,41 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
          if (normalized.normalized) {
            mobileReplacementInputUntilRef.current = 0;
          }
@@ -1380,7 +4166,7 @@ index e488ea125b..8ef900b011 100644
          ws.send(normalized.data);
        };
        // The deferred composition fallback is already committed text, so it
-@@ -1546,6 +1609,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -1546,6 +1747,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
      return () => {
        unmounting = true;
        imageUploadDisposed = true;
@@ -1388,8 +4174,143 @@ index e488ea125b..8ef900b011 100644
        syncMetricsRef.current = null;
        clearEraseSuppressionTimer();
        clearResumeLoadingTimers();
-@@ -2060,6 +2124,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+@@ -1801,7 +2003,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+           role="complementary"
+           aria-label={modelToolsLabel}
+           className={cn(
+-            "font-mondwest fixed top-0 right-0 z-[60] flex h-dvh max-h-dvh w-64 min-w-0 flex-col antialiased",
++            "font-mondwest fixed top-0 right-0 z-[60] flex h-dvh max-h-dvh w-[min(18rem,calc(100vw-3.5rem))] min-w-0 flex-col antialiased",
+             "border-l border-current/20 text-midground",
+             "bg-background-base/95",
+             "transition-transform duration-200 ease-out",
+@@ -1857,6 +2059,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+               isActive={isActive}
+               profile={scopedProfile}
+               onPicked={closeMobilePanel}
++              onOpened={openSessionTab}
+               onNewChat={startFreshDashboardChat}
+               workspaceCwd={workspaceCwd}
+               onWorkspaceChange={setWorkspaceCwd}
+@@ -1870,6 +2073,47 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+   return (
+     <div className="flex min-h-0 flex-1 flex-col gap-2">
+       <PluginSlot name="chat:top" />
++      <div className="flex min-w-0 items-end gap-2">
++        <div className="min-w-0 flex-1">
++          <ChatTabs
++            tabs={chatTabs}
++            activeId={activeTabId}
++            onSelect={selectChatTab}
++            onClose={closeChatTab}
++            onNew={startFreshDashboardChat}
++            newLabel={t.sessions?.newChat ?? "New chat"}
++            closeLabel={t.common?.close ?? "Close"}
++            label={t.sessions?.title ?? "Sessions"}
++          />
++        </div>
++        <div
++          role="group"
++          aria-label={t.app?.messagesView ?? "Chat view"}
++          className="mb-1 flex shrink-0 items-center border border-current/20"
++        >
++          {([
++            ["terminal", t.app?.terminalView ?? "Terminal", SquareTerminal],
++            ["messages", t.app?.messagesView ?? "Messages", MessageSquare],
++          ] as const).map(([view, label, Icon]) => (
++            <button
++              key={view}
++              type="button"
++              onClick={() => setChatView(view)}
++              aria-pressed={chatView === view}
++              title={label}
++              className={cn(
++                "flex items-center gap-1 px-2 py-1 text-[0.6875rem] transition-colors",
++                chatView === view
++                  ? "bg-primary/15 text-foreground"
++                  : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
++              )}
++            >
++              <Icon className="h-3 w-3" aria-hidden />
++              <span className="hidden sm:inline">{label}</span>
++            </button>
++          ))}
++        </div>
++      </div>
+       {mobileModelToolsPortal}
+ 
+       {visibleBanner && (
+@@ -1892,6 +2136,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+           className={cn(
+             "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
+             "p-2 sm:p-3",
++            // Reserve a strip for the floating "copy last response" overlay so
++            // it never sits on top of the terminal's last line (the TUI status
++            // bar). The xterm host is flex-1, so this only shrinks the grid.
++            "pb-10 sm:pb-11 lg:pb-12",
+           )}
+           style={{
+             backgroundColor: terminalBg,
+@@ -1905,6 +2153,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+           />
+ 
++          {chatView === "messages" && (
++            <SessionTranscript
++              sessionId={resumeParam}
++              profile={scopedProfile}
++              onReplyInTerminal={() => {
++                setChatView("terminal");
++                termRef.current?.focus();
++              }}
++            />
++          )}
++
+           {showReconnectOverlay && (
+             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
+               <div className="flex max-w-[min(28rem,calc(100vw-3rem))] flex-col items-start gap-2 border border-warning/60 bg-black/80 px-3 py-2 text-xs text-warning shadow-lg">
+@@ -2018,12 +2277,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+         </div>
+ 
+         {!narrow && !chatPanelCollapsed && (
+-          <div
+-            id="chat-side-panel"
+-            role="complementary"
+-            aria-label={modelToolsLabel}
+-            className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
+-          >
++          <>
++            <PaneResizer
++              value={chatPanelWidth}
++              min={CHAT_PANEL_MIN_WIDTH}
++              max={CHAT_PANEL_MAX_WIDTH}
++              onChange={resizeChatPanel}
++              onReset={resetChatPanelWidth}
++              edge="start"
++              label={t.common?.resizeChatPanel ?? "Resize session panel"}
++              className="lg:flex"
++            />
++            <div
++              id="chat-side-panel"
++              role="complementary"
++              aria-label={modelToolsLabel}
++              className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full"
++              style={{ width: chatPanelWidth }}
++            >
+             <div className="flex h-8 shrink-0 items-center justify-end pr-1">
+               <Button
+                 ghost
+@@ -2052,14 +2323,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+                 activeSessionId={resumeParam}
+                 isActive={isActive}
+                 profile={scopedProfile}
++                onOpened={openSessionTab}
+                 onNewChat={startFreshDashboardChat}
+                 workspaceCwd={workspaceCwd}
+                 onWorkspaceChange={setWorkspaceCwd}
+               />
+             </div>
            </div>
++          </>
          )}
        </div>
 +      <ChatAttachmentBar
@@ -1403,8 +4324,900 @@ index e488ea125b..8ef900b011 100644
        <PluginSlot name="chat:bottom" />
      </div>
    );
+diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
+index 1b1816400e..3e08054a29 100644
+--- a/web/src/pages/SessionsPage.tsx
++++ b/web/src/pages/SessionsPage.tsx
+@@ -9,12 +9,19 @@ import {
+ import { useNavigate } from "react-router";
+ import {
+   AlertTriangle,
++  Archive,
+   CheckCircle2,
+   ChevronDown,
+   ChevronLeft,
+   ChevronRight,
+-  Database,
++  Copy,
++  ExternalLink,
+   ListFilter,
++  Mail,
++  MailOpen,
++  MoreHorizontal,
++  Pin,
++  PinOff,
+   Search,
+   Trash2,
+   Clock,
+@@ -22,12 +29,10 @@ import {
+   Globe,
+   X,
+   Play,
+-  Eraser,
+   Download,
+   Upload,
+   Pencil,
+   Check,
+-  Archive,
+ } from "lucide-react";
+ import { api } from "@/lib/api";
+ import { formatSessionPruneResult } from "@/lib/session-prune";
+@@ -56,7 +61,9 @@ import {
+   sourceLabel,
+ } from "./SessionsPage_sources";
+ import { StructuredReasoning } from "@/components/StructuredReasoning";
+-import { PlatformsCard } from "@/components/PlatformsCard";
++import { SessionActionsMenu } from "@/components/SessionActionsMenu";
++import { groupSessions } from "@/lib/session-groups";
++import type { SessionGroupKey } from "@/lib/session-groups";
+ import { shouldRenderStructuredReasoning } from "@/lib/reasoning-markup";
+ import { Toast } from "@nous-research/ui/ui/components/toast";
+ import { Button } from "@nous-research/ui/ui/components/button";
+@@ -65,7 +72,6 @@ import { ListItem } from "@nous-research/ui/ui/components/list-item";
+ import { Segmented } from "@nous-research/ui/ui/components/segmented";
+ import { Spinner } from "@nous-research/ui/ui/components/spinner";
+ import { Badge } from "@nous-research/ui/ui/components/badge";
+-import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
+ import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+ import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
+ import { Input } from "@nous-research/ui/ui/components/input";
+@@ -218,7 +224,7 @@ function MessageBubble({
+   msg: SessionMessage;
+   highlight?: string;
+ }) {
+-  const { t } = useI18n();
++  const { t, locale } = useI18n();
+ 
+   const ROLE_STYLES: Record<
+     string,
+@@ -298,6 +304,7 @@ function MessageBubble({
+     : msg.tool_name
+       ? `${t.sessions.roles.tool}: ${msg.tool_name}`
+       : style.label;
++  const isUser = msg.role === "user";
+ 
+   // Check if any search term appears as a prefix of any word in content
+   const isHit = (() => {
+@@ -313,10 +320,12 @@ function MessageBubble({
+ 
+   return (
+     <div
+-      className={`${style.bg} p-3 ${isHit ? "ring-1 ring-warning/40" : ""}`}
++      className={`flex max-w-full min-w-0 flex-col gap-1 ${
++        isUser ? "items-end" : "items-stretch"
++      } ${isHit ? "ring-1 ring-warning/40" : ""}`}
+       data-search-hit={isHit || undefined}
+     >
+-      <div className="flex items-center gap-2 mb-1">
++      <div className="flex items-center gap-2 px-1 mb-0.5">
+         <span className={`text-xs font-semibold ${style.text}`}>{label}</span>
+         {isHit && (
+           <Badge tone="warning" className="text-xs py-0 px-1.5">
+@@ -325,30 +334,39 @@ function MessageBubble({
+         )}
+         {msg.timestamp && (
+           <span className="text-xs text-text-tertiary">
+-            {timeAgo(msg.timestamp)}
++            {timeAgo(msg.timestamp, locale)}
+           </span>
+         )}
+       </div>
+-      {msg.content &&
+-        (msg.role === "system" ? (
+-          <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+-            {msg.content}
+-          </div>
+-        ) : shouldRenderStructuredReasoning(msg.role, msg.content) ? (
+-          <StructuredReasoning
+-            content={msg.content}
+-            highlightTerms={highlightTerms}
+-          />
+-        ) : (
+-          <Markdown content={msg.content} highlightTerms={highlightTerms} />
+-        ))}
+-      {msg.tool_calls && msg.tool_calls.length > 0 && (
+-        <div className="mt-1">
+-          {msg.tool_calls.map((tc) => (
+-            <ToolCallBlock key={tc.id} toolCall={tc} />
++      <div
++        className={`hermes-message-bubble min-w-0 max-w-[min(100%,56rem)] border border-border px-3 py-2 ${style.bg} ${
++          isUser ? "rounded-s-lg rounded-ee-lg" : "rounded-e-lg rounded-es-lg"
++        }`}
++      >
++        {msg.content &&
++          (msg.role === "system" ? (
++            <div
++              dir="auto"
++              className="hermes-md-block text-sm text-foreground whitespace-pre-wrap leading-relaxed"
++            >
++              {msg.content}
++            </div>
++          ) : shouldRenderStructuredReasoning(msg.role, msg.content) ? (
++            <StructuredReasoning
++              content={msg.content}
++              highlightTerms={highlightTerms}
++            />
++          ) : (
++            <Markdown content={msg.content} highlightTerms={highlightTerms} />
+           ))}
+-        </div>
+-      )}
++        {msg.tool_calls && msg.tool_calls.length > 0 && (
++          <div className="mt-1">
++            {msg.tool_calls.map((tc) => (
++              <ToolCallBlock key={tc.id} toolCall={tc} />
++            ))}
++          </div>
++        )}
++      </div>
+     </div>
+   );
+ }
+@@ -378,7 +396,7 @@ function MessageList({
+   return (
+     <div
+       ref={containerRef}
+-      className="flex flex-col gap-3 max-h-[600px] overflow-y-auto pr-2"
++      className="flex max-h-[600px] flex-col gap-3 overflow-y-auto px-1 pe-2"
+     >
+       {messages.map((msg, i) => (
+         <MessageBubble key={i} msg={msg} highlight={highlight} />
+@@ -398,6 +416,7 @@ function SessionRow({
+   onDelete,
+   onRename,
+   onExport,
++  onOpenMenu,
+   resumeInChatEnabled,
+ }: SessionRowProps) {
+   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
+@@ -405,7 +424,7 @@ function SessionRow({
+   const [renaming, setRenaming] = useState(false);
+   const [renameValue, setRenameValue] = useState(session.title ?? "");
+   const [renameSaving, setRenameSaving] = useState(false);
+-  const { t } = useI18n();
++  const { t, locale } = useI18n();
+   const navigate = useNavigate();
+ 
+   useEffect(() => {
+@@ -473,8 +492,8 @@ function SessionRow({
+         ghost
+         size="icon"
+         className="text-muted-foreground hover:text-foreground"
+-        aria-label="Rename session"
+-        title="Rename session"
++        aria-label={t.sessions.renameSession ?? "Rename session"}
++        title={t.sessions.renameSession ?? "Rename session"}
+         onClick={(e) => {
+           e.stopPropagation();
+           setRenameValue(
+@@ -492,8 +511,23 @@ function SessionRow({
+         ghost
+         size="icon"
+         className="text-muted-foreground hover:text-foreground"
+-        aria-label="Export session"
+-        title="Export session JSON"
++        aria-label={t.sessions.actions ?? "Session actions"}
++        title={t.common.moreActions ?? "More actions"}
++        onClick={(e) => {
++          e.stopPropagation();
++          const rect = e.currentTarget.getBoundingClientRect();
++          onOpenMenu(session, rect.left, rect.bottom + 4);
++        }}
++      >
++        <MoreHorizontal />
++      </Button>
++
++      <Button
++        ghost
++        size="icon"
++        className="text-muted-foreground hover:text-foreground"
++        aria-label={t.sessions.exportSession ?? "Export session"}
++        title={t.sessions.exportSessionHint ?? "Export session JSON"}
+         onClick={(e) => {
+           e.stopPropagation();
+           onExport(session.id);
+@@ -543,6 +577,10 @@ function SessionRow({
+   return (
+     <div
+       className={`max-w-full min-w-0 overflow-hidden border transition-colors ${containerClasses}`}
++      onContextMenu={(event) => {
++        event.preventDefault();
++        onOpenMenu(session, event.clientX, event.clientY);
++      }}
+     >
+       <div
+         className="flex cursor-pointer items-start gap-3 p-3 transition-colors hover:bg-secondary/30"
+@@ -575,7 +613,7 @@ function SessionRow({
+                         if (e.key === "Enter") void submitRename();
+                         else if (e.key === "Escape") setRenaming(false);
+                       }}
+-                      placeholder="Session title"
++                      placeholder={t.sessions.sessionTitlePlaceholder ?? "Session title"}
+                       className="h-7 min-w-0 flex-1 py-0 text-sm"
+                       disabled={renameSaving}
+                     />
+@@ -583,8 +621,8 @@ function SessionRow({
+                       ghost
+                       size="icon"
+                       className="text-muted-foreground hover:text-success"
+-                      aria-label="Save title"
+-                      title="Save title"
++                      aria-label={t.sessions.saveTitle ?? "Save title"}
++                      title={t.sessions.saveTitle ?? "Save title"}
+                       disabled={renameSaving}
+                       onClick={() => void submitRename()}
+                     >
+@@ -598,8 +636,8 @@ function SessionRow({
+                       ghost
+                       size="icon"
+                       className="text-muted-foreground hover:text-foreground"
+-                      aria-label="Cancel rename"
+-                      title="Cancel rename"
++                      aria-label={t.sessions.cancelRename ?? "Cancel rename"}
++                      title={t.sessions.cancelRename ?? "Cancel rename"}
+                       disabled={renameSaving}
+                       onClick={() => setRenaming(false)}
+                     >
+@@ -617,6 +655,18 @@ function SessionRow({
+                         : t.sessions.untitledSession}
+                   </span>
+                 )}
++                {session.unread && (
++                  <span
++                    className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary"
++                    aria-label={t.common.markUnread}
++                  />
++                )}
++                {session.pinned && (
++                  <Pin
++                    className="h-3 w-3 shrink-0 text-primary"
++                    aria-label={t.sessions.pinned}
++                  />
++                )}
+                 {session.is_active && (
+                   <Badge tone="success" className="shrink-0 text-xs">
+                     <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
+@@ -645,7 +695,7 @@ function SessionRow({
+                   </>
+                 )}
+                 <span className="text-border">&#183;</span>
+-                <span className="shrink-0">{timeAgo(session.last_active)}</span>
++                <span className="shrink-0">{timeAgo(session.last_active, locale)}</span>
+               </div>
+               {snippet && <SnippetHighlight snippet={snippet} />}
+             </div>
+@@ -685,7 +735,6 @@ function SessionRow({
+   );
+ }
+ 
+-type SessionsView = "list" | "overview";
+ 
+ const PAGE_SIZE = 20;
+ 
+@@ -744,6 +793,11 @@ export default function SessionsPage() {
+   const [loading, setLoading] = useState(true);
+   const [search, setSearch] = useState("");
+   const [expandedId, setExpandedId] = useState<string | null>(null);
++  const [sessionMenu, setSessionMenu] = useState<{
++    session: SessionInfo;
++    x: number;
++    y: number;
++  } | null>(null);
+   const [searchResults, setSearchResults] = useState<
+     SessionSearchResult[] | null
+   >(null);
+@@ -752,8 +806,7 @@ export default function SessionsPage() {
+   const importInputRef = useRef<HTMLInputElement | null>(null);
+   const logScrollRef = useRef<HTMLPreElement | null>(null);
+   const [status, setStatus] = useState<StatusResponse | null>(null);
+-  const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
+-  const [view, setView] = useState<SessionsView>("overview");
++  const [, setOverviewSessions] = useState<SessionInfo[]>([]);
+   const [sessionCategory, setSessionCategory] =
+     useState<SessionFilterCategory>("chats");
+   const [sourceSelectionsByCategory, setSourceSelectionsByCategory] =
+@@ -796,6 +849,7 @@ export default function SessionsPage() {
+   const [importingSessions, setImportingSessions] = useState(false);
+   const { toast, showToast } = useToast();
+   const { t } = useI18n();
++  const navigate = useNavigate();
+   const { setAfterTitle, setEnd } = usePageHeader();
+   const { activeAction, actionStatus, dismissLog } = useSystemActions();
+   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+@@ -940,13 +994,13 @@ export default function SessionsPage() {
+         onClick={() => setPruneOpen(true)}
+         prefix={<Archive />}
+       >
+-        Prune old sessions
++        {t.sessions.pruneTitle ?? "Prune old sessions"}
+       </Button>,
+     );
+     return () => {
+       setEnd(null);
+     };
+-  }, [setEnd]);
++  }, [setEnd, t.sessions.pruneTitle]);
+ 
+   useEffect(() => {
+     if (!sourceMenuOpen) return;
+@@ -1113,14 +1167,6 @@ export default function SessionsPage() {
+   const updateSearch = useCallback(
+     (value: string) => {
+       setSearch(value);
+-      if (value.trim()) setView("list");
+-      clearSelection();
+-    },
+-    [clearSelection],
+-  );
+-  const switchView = useCallback(
+-    (next: SessionsView) => {
+-      setView(next);
+       clearSelection();
+     },
+     [clearSelection],
+@@ -1414,10 +1460,10 @@ export default function SessionsPage() {
+         setOverviewSessions((prev) =>
+           prev.map((s) => (s.id === id ? { ...s, title } : s)),
+         );
+-        showToast("Session renamed", "success");
++        showToast(t.sessions.sessionRenamed ?? "Session renamed", "success");
+         loadStats();
+       } catch {
+-        showToast("Failed to rename session", "error");
++        showToast(t.sessions.failedToRename ?? "Failed to rename session", "error");
+       }
+     },
+     [rowProfile, showToast, loadStats],
+@@ -1445,16 +1491,48 @@ export default function SessionsPage() {
+         a.click();
+         URL.revokeObjectURL(url);
+       } catch {
+-        showToast("Failed to export session", "error");
++        showToast(t.sessions.failedToExport ?? "Failed to export session", "error");
+       }
+     },
+     [rowProfile, showToast],
+   );
+ 
++  const handlePatchSession = useCallback(
++    async (
++      session: SessionInfo,
++      fields: { pinned?: boolean; unread?: boolean; archived?: boolean },
++    ) => {
++      try {
++        await api.patchSession(
++          session.id,
++          fields,
++          session.profile ?? rowProfile(session.id),
++        );
++        setSessions((prev) =>
++          prev
++            .map((s) => (s.id === session.id ? { ...s, ...fields } : s))
++            .filter((s) => !s.archived),
++        );
++        setOverviewSessions((prev) =>
++          prev
++            .map((s) => (s.id === session.id ? { ...s, ...fields } : s))
++            .filter((s) => !s.archived),
++        );
++        if (fields.archived) {
++          setExpandedId((prev) => (prev === session.id ? null : prev));
++          showToast(t.common.archive ?? "Session archived", "success");
++        }
++      } catch (e) {
++        showToast(errorMessage(e), "error");
++      }
++    },
++    [rowProfile, setOverviewSessions, showToast, t.common.archive],
++  );
++
+   const handlePrune = useCallback(async () => {
+     const days = parseInt(pruneDays, 10);
+     if (!Number.isFinite(days) || days < 0) {
+-      showToast("Enter a valid number of days", "error");
++      showToast(t.sessions.enterValidDays ?? "Enter a valid number of days", "error");
+       return;
+     }
+     setPruning(true);
+@@ -1466,7 +1544,7 @@ export default function SessionsPage() {
+       setPage(0);
+       loadStats();
+     } catch {
+-      showToast("Failed to prune sessions", "error");
++      showToast(t.sessions.failedToPrune ?? "Failed to prune sessions", "error");
+     } finally {
+       setPruning(false);
+     }
+@@ -1490,15 +1568,8 @@ export default function SessionsPage() {
+   const platformEntries = status
+     ? Object.entries(status.gateway_platforms ?? {})
+     : [];
+-  const recentSessions = overviewSessions
+-    .filter((s) => !s.is_active)
+-    .slice(0, 5);
+-
+   const isSearching = Boolean(search.trim());
+-  const showOverviewTab =
+-    platformEntries.length > 0 || recentSessions.length > 0;
+-  const showList = view === "list" || isSearching || !showOverviewTab;
+-  const showPagination = showList && !isSearching && total > PAGE_SIZE;
++  const showPagination = !isSearching && total > PAGE_SIZE;
+ 
+   const alerts: { message: string; detail?: string }[] = [];
+   if (status) {
+@@ -1591,10 +1662,10 @@ export default function SessionsPage() {
+       >
+         <DialogContent className="max-w-sm">
+           <DialogHeader>
+-            <DialogTitle>Prune old sessions</DialogTitle>
++            <DialogTitle>{t.sessions.pruneTitle ?? "Prune old sessions"}</DialogTitle>
+             <DialogDescription>
+-              Permanently remove archived sessions whose last activity is older
+-              than the given number of days. Active sessions are never pruned.
++              {t.sessions.pruneDescription ??
++                "Permanently remove archived sessions whose last activity is older than the given number of days. Active sessions are never pruned."}
+             </DialogDescription>
+           </DialogHeader>
+           <div className="flex flex-col gap-1.5">
+@@ -1602,7 +1673,7 @@ export default function SessionsPage() {
+               htmlFor="prune-days"
+               className="text-xs font-medium text-muted-foreground"
+             >
+-              Older than (days)
++              {t.sessions.olderThanDays ?? "Older than (days)"}
+             </label>
+             <Input
+               id="prune-days"
+@@ -1631,44 +1702,44 @@ export default function SessionsPage() {
+               className="gap-1.5"
+             >
+               {pruning && <Spinner className="text-sm" />}
+-              Prune
++              {t.sessions.pruneAction ?? "Prune"}
+             </Button>
+           </DialogFooter>
+         </DialogContent>
+       </Dialog>
+ 
+       {stats && (
+-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border border-border bg-background-base/40 px-4 py-3">
++        <div className="grid grid-cols-3 gap-x-4 gap-y-3 border border-border bg-background-base/40 px-4 py-3 sm:flex sm:flex-wrap sm:items-center sm:gap-x-6 sm:gap-y-2">
+           <div className="flex flex-col">
+             <span className="text-lg font-semibold tabular-nums leading-none">
+               {stats.total}
+             </span>
+-            <span className="text-xs text-muted-foreground">Total</span>
++            <span className="text-xs text-muted-foreground">{t.sessions.total ?? "Total"}</span>
+           </div>
+           <div className="flex flex-col">
+             <span className="text-lg font-semibold tabular-nums leading-none text-success">
+               {stats.active_store}
+             </span>
+-            <span className="text-xs text-muted-foreground">Active in store</span>
++            <span className="text-xs text-muted-foreground">{t.sessions.activeInStore ?? "Active in store"}</span>
+           </div>
+           <div className="flex flex-col">
+             <span className="text-lg font-semibold tabular-nums leading-none">
+               {stats.archived}
+             </span>
+-            <span className="text-xs text-muted-foreground">Archived</span>
++            <span className="text-xs text-muted-foreground">{t.sessions.archivedLabel ?? "Archived"}</span>
+           </div>
+           <div className="flex flex-col">
+             <span className="text-lg font-semibold tabular-nums leading-none">
+               {stats.messages}
+             </span>
+-            <span className="text-xs text-muted-foreground">Messages</span>
++            <span className="text-xs text-muted-foreground">{t.sessions.messagesLabel ?? "Messages"}</span>
+           </div>
+           {Object.keys(stats.by_source).length > 0 && (
+             <div className="flex flex-col">
+               <span className="text-lg font-semibold tabular-nums leading-none">
+                 {Object.keys(stats.by_source).length}
+               </span>
+-              <span className="text-xs text-muted-foreground">Sources</span>
++              <span className="text-xs text-muted-foreground">{t.sessions.sources ?? "Sources"}</span>
+             </div>
+           )}
+         </div>
+@@ -1760,7 +1831,7 @@ export default function SessionsPage() {
+         </div>
+       )}
+ 
+-      {(showOverviewTab && !isSearching) || showList ? (
++      {(
+         <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:gap-3">
+           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:gap-3">
+             <Segmented
+@@ -1859,20 +1930,8 @@ export default function SessionsPage() {
+               )}
+             </div>
+ 
+-            {showOverviewTab && !isSearching && (
+-              <Segmented
+-                className="w-fit shrink-0"
+-                size="md"
+-                value={view}
+-                onChange={switchView}
+-                options={[
+-                  { value: "overview", label: t.sessions.overview },
+-                  { value: "list", label: t.sessions.history },
+-                ]}
+-              />
+-            )}
+ 
+-            {showList && (
++            {(
+               <div className="relative min-w-0 w-full sm:w-auto sm:min-w-[12rem] sm:max-w-md sm:flex-1">
+                 {searching ? (
+                   <Spinner className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[0.875rem] text-primary" />
+@@ -1899,21 +1958,13 @@ export default function SessionsPage() {
+               </div>
+             )}
+ 
+-            {showList && emptyCount > 0 && !isSearching && (
+-              <Button
+-                outlined
+-                destructive
+-                size="sm"
+-                className="shrink-0"
+-                onClick={() => setDeleteEmptyOpen(true)}
+-                aria-label={t.sessions.deleteEmpty}
+-                title={t.sessions.deleteEmpty}
+-                prefix={<Eraser />}
++            {emptyCount > 0 && !isSearching && (
++              <span
++                className="shrink-0 text-[0.6875rem] leading-snug text-text-tertiary"
++                title={t.common.autoCleanupHint ?? t.sessions.emptyRuns}
+               >
+-                <span className="font-mondwest normal-case text-xs">
+-                  {t.sessions.deleteEmpty} ({emptyCount})
+-                </span>
+-              </Button>
++                {t.sessions.emptyRuns ?? t.common.autoCleanupHint}
++              </span>
+             )}
+ 
+             {!isSearching && (
+@@ -1923,12 +1974,12 @@ export default function SessionsPage() {
+                 className="shrink-0"
+                 disabled={importingSessions}
+                 onClick={() => importInputRef.current?.click()}
+-                aria-label="Import exported sessions"
+-                title="Import exported session JSON or JSONL"
++                aria-label={t.sessions.importSessionsHint ?? "Import exported sessions"}
++                title={t.sessions.importSessionsHint ?? "Import exported session JSON or JSONL"}
+                 prefix={importingSessions ? <Spinner /> : <Upload />}
+               >
+                 <span className="font-mondwest normal-case text-xs">
+-                  Import sessions
++                  {t.sessions.importSessions ?? "Import sessions"}
+                 </span>
+               </Button>
+             )}
+@@ -1937,16 +1988,16 @@ export default function SessionsPage() {
+           {showPagination && (
+             <SessionsPagination
+               compact
+-              className="shrink-0 sm:ml-auto"
++              className="hidden shrink-0 sm:ml-auto sm:flex"
+               page={page}
+               total={total}
+               onPageChange={goToPage}
+             />
+           )}
+         </div>
+-      ) : null}
++      )}
+ 
+-      {showList && selectedIds.size > 0 && (
++      {selectedIds.size > 0 && (
+         <div
+           className="flex flex-wrap items-center gap-2 border border-primary/30 bg-primary/[0.06] px-3 py-2"
+           role="region"
+@@ -2011,8 +2062,7 @@ export default function SessionsPage() {
+         </div>
+       )}
+ 
+-      {showList ? (
+-        filtered.length === 0 ? (
++      {filtered.length === 0 ? (
+           <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
+             <Clock className="h-8 w-8 mb-3 opacity-40" />
+             <p className="text-sm font-medium">
+@@ -2030,27 +2080,59 @@ export default function SessionsPage() {
+           </div>
+         ) : (
+           <>
+-            <div className="flex min-w-0 flex-col gap-1.5">
+-              {filtered.map((s, index) => (
+-                <SessionRow
+-                  key={s.id}
+-                  session={s}
+-                  snippet={snippetMap.get(s.id)}
+-                  searchQuery={search || undefined}
+-                  isExpanded={expandedId === s.id}
+-                  isSelected={selectedIds.has(s.id)}
+-                  onToggle={() =>
+-                    setExpandedId((prev) => (prev === s.id ? null : s.id))
+-                  }
+-                  onSelectClick={(event) =>
+-                    handleSelectClick(event, index, filtered)
+-                  }
+-                  onDelete={() => sessionDelete.requestDelete(s.id)}
+-                  onRename={handleRename}
+-                  onExport={handleExport}
+-                  resumeInChatEnabled={resumeInChatEnabled}
+-                />
+-              ))}
++            <div className="flex min-w-0 flex-col gap-3">
++              {groupSessions(filtered as SessionInfo[]).map((group) => {
++                const groupLabel: Record<SessionGroupKey, string> = {
++                  pinned: t.sessions.pinned ?? "Pinned",
++                  today: t.sessions.today ?? "Today",
++                  yesterday: t.sessions.yesterday ?? "Yesterday",
++                  week: t.sessions.previous7Days ?? "Previous 7 days",
++                  earlier: t.sessions.earlier ?? "Earlier",
++                };
++                return (
++                  <section
++                    key={group.key}
++                    className="flex min-w-0 flex-col gap-1.5"
++                    aria-label={groupLabel[group.key]}
++                  >
++                    <h3 className="flex items-center gap-1.5 px-1 text-[0.6875rem] uppercase tracking-[0.14em] text-text-tertiary">
++                      {group.key === "pinned" && (
++                        <Pin className="h-3 w-3" aria-hidden />
++                      )}
++                      {groupLabel[group.key]}
++                      <span className="tabular-nums opacity-70">
++                        {group.sessions.length}
++                      </span>
++                    </h3>
++                    {group.sessions.map((s) => {
++                      const index = filtered.findIndex((row) => row.id === s.id);
++                      return (
++                        <SessionRow
++                          key={s.id}
++                          session={s}
++                          snippet={snippetMap.get(s.id)}
++                          searchQuery={search || undefined}
++                          isExpanded={expandedId === s.id}
++                          isSelected={selectedIds.has(s.id)}
++                          onToggle={() =>
++                            setExpandedId((prev) => (prev === s.id ? null : s.id))
++                          }
++                          onSelectClick={(event) =>
++                            handleSelectClick(event, index, filtered)
++                          }
++                          onDelete={() => sessionDelete.requestDelete(s.id)}
++                          onRename={handleRename}
++                          onExport={handleExport}
++                          onOpenMenu={(session, x, y) =>
++                            setSessionMenu({ session, x, y })
++                          }
++                          resumeInChatEnabled={resumeInChatEnabled}
++                        />
++                      );
++                    })}
++                  </section>
++                );
++              })}
+             </div>
+ 
+             {showPagination && (
+@@ -2061,73 +2143,115 @@ export default function SessionsPage() {
+               />
+             )}
+           </>
+-        )
+-      ) : (
+-        <div className="flex min-w-0 flex-col gap-4">
+-          {platformEntries.length > 0 && status && (
+-            <PlatformsCard platforms={platformEntries} />
+-          )}
+-
+-          {recentSessions.length > 0 && (
+-            <Card className="min-w-0 max-w-full overflow-hidden">
+-              <CardHeader className="min-w-0">
+-                <div className="flex min-w-0 items-center gap-2">
+-                  <Clock className="h-5 w-5 shrink-0 text-muted-foreground" />
+-                  <CardTitle className="min-w-0 truncate text-base">
+-                    {t.status.recentSessions}
+-                  </CardTitle>
+-                </div>
+-              </CardHeader>
+-
+-              <CardContent className="grid min-w-0 gap-3">
+-                {recentSessions.map((s) => (
+-                  <div
+-                    key={s.id}
+-                    className="flex min-w-0 max-w-full flex-col gap-2 border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
+-                  >
+-                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+-                      <span
+-                        className={`font-mondwest normal-case min-w-0 truncate text-sm ${s.title ? "font-medium" : "text-muted-foreground italic"}`}
+-                      >
+-                        {s.title ??
+-                          (s.preview
+-                            ? s.preview.slice(0, 60)
+-                            : t.common.untitled)}
+-                      </span>
+-
+-                      <span className="min-w-0 break-words text-xs text-muted-foreground">
+-                        {s.model && (
+-                          <>
+-                            <span className="font-mono-ui">
+-                              {s.model.split("/").pop()}
+-                            </span>{" "}
+-                            ·{" "}
+-                          </>
+-                        )}
+-                        {s.message_count} {t.common.msgs} ·{" "}
+-                        {timeAgo(s.last_active)}
+-                      </span>
+-
+-                      {s.preview && s.title && (
+-                        <p className="font-mondwest normal-case min-w-0 max-w-full text-xs leading-snug text-text-tertiary [overflow-wrap:anywhere]">
+-                          {s.preview}
+-                        </p>
+-                      )}
+-                    </div>
++        )}
+ 
+-                    <Badge
+-                      tone="outline"
+-                      className="shrink-0 self-start text-xs sm:self-center"
+-                    >
+-                      <Database className="mr-1 h-3 w-3" />
+-                      {s.source ? sourceLabel(s.source) : "local"}
+-                    </Badge>
+-                  </div>
+-                ))}
+-              </CardContent>
+-            </Card>
+-          )}
+-        </div>
++      {sessionMenu && (
++        <SessionActionsMenu
++          x={sessionMenu.x}
++          y={sessionMenu.y}
++          label={t.sessions.actions ?? "Session actions"}
++          onClose={() => setSessionMenu(null)}
++          actions={[
++            {
++              key: "resume",
++              label: t.sessions.resumeInChat,
++              icon: Play,
++              onSelect: () =>
++                navigate(
++                  `/chat?resume=${encodeURIComponent(sessionMenu.session.id)}`,
++                ),
++            },
++            {
++              key: "new-tab",
++              label: t.common.openInNewTab ?? "Open in new tab",
++              icon: ExternalLink,
++              onSelect: () =>
++                window.open(
++                  `/chat?resume=${encodeURIComponent(sessionMenu.session.id)}`,
++                  "_blank",
++                  "noopener,noreferrer",
++                ),
++            },
++            {
++              key: "rename",
++              label: t.common.rename ?? "Rename",
++              icon: Pencil,
++              onSelect: () => {
++                const current =
++                  sessionMenu.session.title &&
++                  sessionMenu.session.title !== "Untitled"
++                    ? sessionMenu.session.title
++                    : "";
++                const next = window.prompt(t.common.rename ?? "Rename", current);
++                if (next?.trim()) {
++                  void handleRename(
++                    sessionMenu.session.id,
++                    next.trim(),
++                    sessionMenu.session.profile,
++                  );
++                }
++              },
++            },
++            {
++              key: "pin",
++              label: sessionMenu.session.pinned
++                ? (t.common.unpin ?? "Unpin")
++                : (t.common.pin ?? "Pin"),
++              icon: sessionMenu.session.pinned ? PinOff : Pin,
++              onSelect: () =>
++                void handlePatchSession(sessionMenu.session, {
++                  pinned: !sessionMenu.session.pinned,
++                }),
++            },
++            {
++              key: "unread",
++              label: sessionMenu.session.unread
++                ? (t.common.markRead ?? "Mark as read")
++                : (t.common.markUnread ?? "Mark as unread"),
++              icon: sessionMenu.session.unread ? MailOpen : Mail,
++              onSelect: () =>
++                void handlePatchSession(sessionMenu.session, {
++                  unread: !sessionMenu.session.unread,
++                }),
++            },
++            {
++              key: "copy-id",
++              label: t.common.copyId ?? "Copy ID",
++              icon: Copy,
++              onSelect: () => {
++                void navigator.clipboard
++                  .writeText(sessionMenu.session.id)
++                  .then(() =>
++                    showToast(t.common.sessionIdCopied ?? "Session ID copied", "success"),
++                  )
++                  .catch(() =>
++                    showToast(t.common.copyFailed ?? "Copy failed", "error"),
++                  );
++              },
++            },
++            {
++              key: "export",
++              label: t.common.export ?? "Export",
++              icon: Download,
++              dividerBefore: true,
++              onSelect: () => void handleExport(sessionMenu.session.id),
++            },
++            {
++              key: "archive",
++              label: t.common.archive ?? "Archive",
++              icon: Archive,
++              onSelect: () =>
++                void handlePatchSession(sessionMenu.session, { archived: true }),
++            },
++            {
++              key: "delete",
++              label: t.sessions.deleteSession,
++              icon: Trash2,
++              danger: true,
++              onSelect: () => sessionDelete.requestDelete(sessionMenu.session.id),
++            },
++          ]}
++        />
+       )}
+ 
+       <PluginSlot name="sessions:bottom" />
+@@ -2143,6 +2267,7 @@ interface SessionRowProps {
+   onRename: (id: string, title: string, profile?: string) => Promise<void>;
+   onSelectClick: (event: React.MouseEvent) => void;
+   onToggle: () => void;
++  onOpenMenu: (session: SessionInfo, x: number, y: number) => void;
+   resumeInChatEnabled: boolean;
+   searchQuery?: string;
+   session: SessionInfo;
 diff --git a/web/src/themes/presets.ts b/web/src/themes/presets.ts
-index 0a0f92e277..2e419dcc70 100644
+index 0a0f92e277..df4a2d6528 100644
 --- a/web/src/themes/presets.ts
 +++ b/web/src/themes/presets.ts
 @@ -213,8 +213,8 @@ export const nousBlueTheme: DashboardTheme = {
@@ -1418,3 +5231,66 @@ index 0a0f92e277..2e419dcc70 100644
    seriesColors: {
      inputTokenAccent: "#001934",
      outputTokenAccent: "#0053fd",
+@@ -223,33 +223,44 @@ export const nousBlueTheme: DashboardTheme = {
+ };
+ 
+ /**
+- * Same look as ``defaultTheme`` but with a larger root font size, looser
+- * line-height, and ``spacious`` density so every rem-based size in the
+- * dashboard scales up. For users who find the default 15px UI too dense.
++ * A theme's Large variant: the same palette, terminal colours, swatches and
++ * fonts as its base theme, with a larger root font size, looser line-height,
++ * and ``spacious`` density so every rem-based size in the dashboard scales up.
++ * Generated for EVERY built-in so any look can be had in a readable size.
+  */
+-export const defaultLargeTheme: DashboardTheme = {
+-  name: "default-large",
+-  label: "Hermes Teal (Large)",
+-  description: "Hermes Teal with bigger fonts and roomier spacing",
+-  palette: defaultTheme.palette,
+-  typography: {
+-    ...DEFAULT_TYPOGRAPHY,
+-    baseSize: "18px",
+-    lineHeight: "1.65",
+-  },
+-  layout: {
+-    ...DEFAULT_LAYOUT,
+-    density: "spacious",
+-  },
+-};
++export function largeVariant(theme: DashboardTheme): DashboardTheme {
++  return {
++    ...theme,
++    name: `${theme.name}-large`,
++    label: `${theme.label} (Large)`,
++    description: `${theme.label} with bigger fonts and roomier spacing`,
++    typography: {
++      ...theme.typography,
++      baseSize: "18px",
++      lineHeight: "1.65",
++    },
++    layout: {
++      ...theme.layout,
++      density: "spacious",
++    },
++  };
++}
++
++export const defaultLargeTheme = largeVariant(defaultTheme);
+ 
+ export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
+   default: defaultTheme,
+   "default-large": defaultLargeTheme,
+   "nous-blue": nousBlueTheme,
++  "nous-blue-large": largeVariant(nousBlueTheme),
+   midnight: midnightTheme,
++  "midnight-large": largeVariant(midnightTheme),
+   ember: emberTheme,
++  "ember-large": largeVariant(emberTheme),
+   mono: monoTheme,
++  "mono-large": largeVariant(monoTheme),
+   cyberpunk: cyberpunkTheme,
++  "cyberpunk-large": largeVariant(cyberpunkTheme),
+   rose: roseTheme,
++  "rose-large": largeVariant(roseTheme),
+ };

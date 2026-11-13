@@ -19,6 +19,7 @@ A complete, local dashboard for Hermes Agent — with **Context Lens** as its fl
 
 <p>
   <a href="#why-this-dashboard">Why this dashboard</a> ·
+  <a href="#session-workspace">Session workspace</a> ·
   <a href="#context-lens">Context Lens</a> ·
   <a href="#install">Install</a> ·
   <a href="#whats-inside">What's inside</a> ·
@@ -44,6 +45,33 @@ It reads `state.db` directly — read-only, already recorded, no instrumentation
 - **History for free.** Because it reads the database Hermes already writes, your entire recorded history works on day one. Nothing needs to be instrumented going forward.
 - **Local-only by construction.** No network calls, no telemetry, no second database.
 - **English and فارسی.** The tab follows the dashboard's global language picker and lays itself out RTL in Persian. There is no plugin-local language toggle to forget.
+
+## Session workspace
+
+The optional `patches/hermes-0.23-dashboard-full.patch` also brings the dashboard's
+session and chat surfaces up to the desktop app's standard — see
+[`patches/README.md`](patches/README.md) for install steps and the full list.
+
+- **Multi-session tabs** above Chat: switch, close, or start a new conversation;
+  tabs persist and follow `?resume=` deep links.
+- **Resizable shell**: drag the main sidebar or the chat session rail; widths
+  persist per browser, double-click resets, keyboard resizing included, and the
+  handles mirror correctly in RTL.
+- **A real session rail**: search, pinned section, Today / Yesterday /
+  Previous 7 days groups, unread dots, inline rename, and a right-click menu
+  (Resume, Open in new tab, Rename, Pin, Read/unread, Copy ID, Export, Archive,
+  Delete). The Sessions page shares the same groups and menu.
+- **Chat bubbles, not a wall of text**: transcripts render per message, with
+  tool results as collapsible rows and tool calls as chips.
+- **Per-block RTL**: each markdown block chooses its own direction, so a Persian
+  paragraph reads right-to-left inside an otherwise English reply — while code,
+  paths and JSON stay LTR and the dashboard itself never flips.
+- **Messages view in Chat**: read the current session as bubbles (live-refreshing)
+  without leaving the terminal; "Reply in terminal" switches back. The PTY stays
+  alive underneath.
+- **No empty-session housekeeping**: drafts created by a fresh PTY are swept
+  automatically every 15 minutes (active and archived rows are never touched), so
+  the old "Delete empty" button is gone.
 
 ## Context Lens
 

@@ -1,6 +1,6 @@
 name: context-lens
-version: 0.2.0
-description: "Context dashboard for Hermes: Context Lens composition/trends, skills/tools/command activity, and the session fleet — as /lens, `hermes context-lens`, and a dashboard tab."
+version: 0.3.0
+description: "Context dashboard for Hermes: Context Lens composition/trends, skills/tools/command activity, the session fleet, and a desktop-style session workspace — as /lens, `hermes context-lens`, and a dashboard tab."
 author: Farzin
 license: MIT
 requires_hermes: ">=0.22.0"
